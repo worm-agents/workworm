@@ -35,7 +35,7 @@ La versión actual funciona **solo en Windows 10/11**.
 ## Instalación
 
 ```powershell
-git clone https://github.com/WormAgent/workworm.git
+git clone https://github.com/worm-agents/workworm.git
 cd workworm
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -64,19 +64,23 @@ Para que el tablero y el agente arranquen solos al iniciar sesión, registrá la
 powershell -ExecutionPolicy Bypass -File .\install_task.ps1
 ```
 
+También se puede desde el tablero: si las tareas faltan, están deshabilitadas o apuntan a otra carpeta (por ejemplo, porque moviste el proyecto), arriba aparece un aviso con el botón **Instalar tareas**. Mientras tanto el agente solo corre cuando tocás **Revisar ahora**.
+
 ## Conectar Gmail
 
 1. En [Google Cloud Console](https://console.cloud.google.com/), creá un proyecto y habilitá **Gmail API**.
 2. Configurá la pantalla de consentimiento OAuth como usuario externo y agregá tu correo como usuario de prueba.
-3. Creá un cliente OAuth de tipo **Desktop app**, descargá el JSON y guardalo como `.secrets/credentials.json`.
-4. En **Configuración** del tablero, pulsá **Autorizar Gmail en el navegador**. Los tokens quedan en `.secrets/`, fuera de Git.
+3. Creá un cliente OAuth de tipo **Desktop app** y descargá el JSON.
+4. En el tablero, **Configuración → Cuentas y Gmail**: subí ese JSON, escribí tu nombre y tus cuentas, pulsá **Guardar cuentas** y después **Autorizar** en cada una. La credencial y los tokens quedan en `.secrets/`, fuera de Git.
 
 WorkWorm usa dos conexiones (`config.json → gmail_accounts`):
 
 - **`main`**: la cuenta con la que postulás y hablás con reclutadores.
 - **`alerts`**: la que recibe las alertas de LinkedIn y manda los avisos de WorkWorm.
 
-Pueden ser la misma cuenta. Se piden permisos de lectura, redacción y (en `main`) etiquetas. Durante la búsqueda no se envían correos.
+Pueden ser la misma cuenta: en ese caso se autoriza una sola vez. Si cambiás una dirección, su autorización anterior se borra y hay que autorizar la nueva. Se piden permisos de lectura, redacción y (en `main`) etiquetas. Durante la búsqueda no se envían correos.
+
+Mientras la app de Google Cloud esté en modo **Testing**, Google invalida la autorización cada 7 días. Cuando pasa, el tablero muestra «Venció la autorización de Gmail» y el agente no lee ni manda correos hasta que la renueves en **Configuración → Gmail**. Para que no venza, en la pantalla de consentimiento OAuth pulsá **Publish app** (pasa a «In production»). No hace falta que Google la verifique para usarla vos: al autorizar vas a ver el aviso «Google no verificó esta app», elegí **Configuración avanzada → Ir a…**.
 
 Mientras la app de Google Cloud esté en modo **Testing**, Google invalida la autorización cada 7 días. Cuando pasa, el tablero muestra «Venció la autorización de Gmail» y el agente no lee ni manda correos hasta que la renueves en **Configuración → Gmail**. Para que no venza, en la pantalla de consentimiento OAuth pulsá **Publish app** (pasa a «In production»). No hace falta que Google la verifique para usarla vos: al autorizar vas a ver el aviso «Google no verificó esta app», elegí **Configuración avanzada → Ir a…**.
 
@@ -104,10 +108,20 @@ En cada ciclo (tarea `WorkWorm` o botón **Ejecutar ciclo ahora**), `agent.run()
 
 1. **Busca ofertas** cada `collect_every_hours` horas y completa las descripciones que faltan.
 2. **Postula** dentro de `apply_hours`, hasta el máximo diario. Claude decide si la oferta encaja, elige el CV y redacta el texto. Si el aviso tiene un correo, manda el CV desde Gmail. Si no, completa el formulario en un **Edge aparte** con perfil propio (`data/edge-profile`) y lo cierra al terminar. Si el sitio pide crear cuenta, captcha o un dato que no está en tu perfil, la oferta pasa a «Requiere tu atención».
-3. **Sigue los correos** dentro de `reply_hours`: clasifica las respuestas y contesta en el mismo hilo. Acepta el horario de entrevista que propongan y responde con lo que dice `profile.md`. Ante una propuesta formal, un dato faltante o algo ambiguo, te avisa con un correo `[WorkWorm]`. Con `reply_to_recruiters: false` no contesta: le respondés vos.
-4. **Hace un seguimiento** a los `followup_after_days` días sin respuesta, una sola vez. Con `followups: false` no manda seguimientos.
+3. **Sigue los correos** dentro de `reply_hours`: clasifica las respuestas y contesta en el mismo hilo. Acepta el horario de entrevista que propongan y responde con lo que dice `profile.md`. Ante una propuesta formal, un dato faltante o algo ambiguo, te avisa con un correo `[WorkWorm]`.
+4. **Hace un seguimiento** a los `followup_after_days` días sin respuesta, una sola vez.
 
-Las ofertas de LinkedIn no se autopostulan: quedan en «Postular en LinkedIn» con el link. Te postulás vos, pulsás «Ya me postulé» y el agente sigue la conversación por correo.
+### Cuándo le escribe a un reclutador
+
+El agente siempre lee los correos y actualiza los estados. Que además conteste o mande seguimientos se decide en tres niveles:
+
+- **Para todos**: **Configuración → Piloto automático → Responder a reclutadores** (`reply_to_recruiters`) y **Mandar seguimientos** (`followups`).
+- **Por conversación**: el interruptor del menú `···` de cada postulación en el Pipeline, o la lista **Conversaciones con reclutadores** en Configuración. Las calladas llevan la etiqueta «BOT CALLADO».
+- **Por reclutador o empresa**: **No escribirle nunca a** (`muted_contacts`): un correo, dominio o nombre de empresa por línea.
+
+Las conversaciones que no empezó el agente arrancan calladas: las postulaciones que marcás con «Ya me postulé», las que contestaste vos desde Gmail y las de reclutadores que te escriben sin una postulación de por medio (aparecen con la etiqueta «TE ESCRIBIERON»). Si querés que el agente siga alguna, activala desde su interruptor.
+
+Las ofertas de LinkedIn no se autopostulan: quedan en «Postular en LinkedIn» con el link. Te postulás vos, pulsás «Ya me postulé» y el agente sigue la conversación por correo (callado, salvo que lo actives).
 
 La primera vez, en **Configuración → Abrir Edge del agente**, iniciá sesión en los sitios donde vas a postular (Indeed, Get on Board, Computrabajo, Bumeran) y cerrá la ventana.
 

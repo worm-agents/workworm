@@ -41,7 +41,11 @@ reload_changed_modules()
 from radar import LOCAL_TZ, STATUSES  # noqa: E402
 
 
-st.set_page_config(page_title="WorkWorm", page_icon="🪱", layout="wide")
+ASSETS = Path(__file__).parent / "assets"
+st.set_page_config(page_title="WorkWorm", page_icon=str(ASSETS / "workworm.png"), layout="wide")
+# el gusano de worm-agents.com, inline para que herede el brillo y la animación del encabezado
+WORM_ICON = (ASSETS / "workworm.svg").read_text(encoding="utf-8").replace(
+    "<svg ", "<svg class='worm' width='84' height='84' ", 1)
 st.markdown("""
 <style>
   /* ---- WorkWorm: amber CRT, GRUB boot-menu style ---- */
@@ -188,6 +192,15 @@ def save_config(cfg: dict) -> None:
     radar.CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def ban(company: str) -> None:
+    """Ban a company: never apply there again and drop its pending offers."""
+    if agent.ban_company(cfg, company):
+        save_config(cfg)
+        moved = agent.apply_exclusions(cfg, agent.BAN_STATUSES)
+        st.toast(f"«{company}» baneada · {moved} ofertas pendientes excluidas")
+    st.rerun()
+
+
 cfg = radar.config()
 pilot = cfg["autopilot"]
 all_jobs = radar.jobs("all")
@@ -204,15 +217,19 @@ week_ago = datetime.now(timezone.utc) - timedelta(days=7)
 
 prediction = cfg.get("branding", {}).get("prediction", "")
 label, _, value = prediction.rpartition(":")
-st.markdown("<div class='hero'><div class='hero-brand'><svg class='worm' width='96' height='36' viewBox='0 0 96 36' xmlns='http://www.w3.org/2000/svg' shape-rendering='crispEdges'><rect x='60' y='0' width='6' height='6' fill='#ffb000'/><rect x='66' y='0' width='6' height='6' fill='#ffb000'/><rect x='72' y='0' width='6' height='6' fill='#ffb000'/><rect x='54' y='6' width='6' height='6' fill='#ffb000'/><rect x='60' y='6' width='6' height='6' fill='#ffb000'/><rect x='66' y='6' width='6' height='6' fill='#ffb000'/><rect x='72' y='6' width='6' height='6' fill='#ffb000'/><rect x='78' y='6' width='6' height='6' fill='#ffb000'/><rect x='12' y='12' width='6' height='6' fill='#ffb000'/><rect x='18' y='12' width='6' height='6' fill='#ffb000'/><rect x='48' y='12' width='6' height='6' fill='#ffb000'/><rect x='54' y='12' width='6' height='6' fill='#ffb000'/><rect x='60' y='12' width='6' height='6' fill='#ffb000'/><rect x='66' y='12' width='6' height='6' fill='#0b0700'/><rect x='72' y='12' width='6' height='6' fill='#ffb000'/><rect x='78' y='12' width='6' height='6' fill='#ffb000'/><rect x='84' y='12' width='6' height='6' fill='#ffb000'/><rect x='6' y='18' width='6' height='6' fill='#ffb000'/><rect x='12' y='18' width='6' height='6' fill='#ffb000'/><rect x='18' y='18' width='6' height='6' fill='#ffb000'/><rect x='24' y='18' width='6' height='6' fill='#ffb000'/><rect x='42' y='18' width='6' height='6' fill='#ffb000'/><rect x='48' y='18' width='6' height='6' fill='#ffb000'/><rect x='54' y='18' width='6' height='6' fill='#ffb000'/><rect x='60' y='18' width='6' height='6' fill='#ffb000'/><rect x='66' y='18' width='6' height='6' fill='#ffb000'/><rect x='72' y='18' width='6' height='6' fill='#ffb000'/><rect x='78' y='18' width='6' height='6' fill='#ffb000'/><rect x='0' y='24' width='6' height='6' fill='#ffb000'/><rect x='6' y='24' width='6' height='6' fill='#ffb000'/><rect x='24' y='24' width='6' height='6' fill='#ffb000'/><rect x='30' y='24' width='6' height='6' fill='#ffb000'/><rect x='36' y='24' width='6' height='6' fill='#ffb000'/><rect x='42' y='24' width='6' height='6' fill='#ffb000'/><rect x='48' y='24' width='6' height='6' fill='#ffb000'/><rect x='54' y='24' width='6' height='6' fill='#ffb000'/><rect x='0' y='30' width='6' height='6' fill='#ffb000'/><rect x='30' y='30' width='6' height='6' fill='#ffb000'/><rect x='36' y='30' width='6' height='6' fill='#ffb000'/><rect x='42' y='30' width='6' height='6' fill='#ffb000'/><rect x='48' y='30' width='6' height='6' fill='#ffb000'/></svg><span class='hero-title'>WORKWORM</span></div>"
+st.markdown("<div class='hero'><div class='hero-brand'>" + WORM_ICON + "<span class='hero-title'>WORKWORM</span></div>"
             + (f"<div class='hero-sub'>-OBJETIVO-</div><div class='hero-pred'>{label.strip()}: <b>{value.strip()}</b></div>"
                if prediction else "") + "</div>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def scheduler_status() -> dict:
+    return agent.scheduler_status()
+
+
 def next_run_text() -> tuple[str, str]:
     """('13:00', 'en 2 h 10 min') for the next scheduled agent run."""
-    when = agent.next_run()
+    when = scheduler_status()["next"]
     if not when:
         return "", ""
     minutes = max(0, int((when - datetime.now(when.tzinfo)).total_seconds() // 60))
@@ -259,6 +276,8 @@ def control_panel():
         at, _ = next_run_text()
         state = ("○ PAUSED" if not pilot_now["enabled"] else
                  "○ SLEEPING · tope del día" if sent_today >= cap and agent.queue_size() else "○ SLEEPING")
+        if not at and scheduler_status()["state"] != "ok":
+            at = "solo a mano"
         left.markdown(f"<div class='status-line'><b>{state}</b> &nbsp;·&nbsp; próxima revisión {at or '—'}</div>",
                       unsafe_allow_html=True)
         if mid.button("▶ REVISAR AHORA", type="primary", width="stretch", key="start-cycle",
@@ -295,6 +314,17 @@ def gmail_expired() -> list[str]:
 for notice in dict.fromkeys(gmail_expired()):
     st.error(f"[!!] {notice}")
 
+_sched = scheduler_status()
+if _sched["state"] in ("missing", "moved", "disabled"):
+    _warn, _fix = st.columns([5, 1.4], vertical_alignment="center")
+    _warn.warning(f"[!!] {_sched['detail']} El agente no corre solo: solo cuando tocás «Revisar ahora».")
+    if _fix.button("Instalar tareas", key="install-tasks",
+                   help="Registra en Windows las tareas «WorkWorm» (ciclo del agente) y «WorkWorm - Tablero» "
+                        "para esta carpeta. También las habilita."):
+        ok, out = agent.install_tasks()
+        scheduler_status.clear()
+        (st.success if ok else st.error)(out or ("Tareas instaladas" if ok else "No se pudieron instalar"))
+
 attention =[j for j in all_jobs if j["status"] == "action_needed"]
 manual_jobs = [j for j in all_jobs if j["status"] == "manual"]
 if attention:
@@ -307,8 +337,24 @@ with settings:
     settings_general, tailoring_tab = st.tabs(["General", "CV, carta, idioma y exclusiones"])
 
 
+def bot_toggle(j: dict, key: str = "bot") -> None:
+    """Switch the agent on/off for one conversation, saying why it stays quiet anyway."""
+    on = bool(j.get("bot_replies", 1))
+    # The stored value is part of the key: both toggles of a conversation (Pipeline and Configuración) redraw fresh.
+    st.toggle("El agente responde y hace seguimiento en esta conversación", value=on, key=f"{key}-{j['id']}-{int(on)}",
+              on_change=agent.set_bot_replies, args=(j["id"], not on))
+    rule = agent.muted_contact(cfg, j.get("recipient") or "", j.get("company") or "")
+    if rule:
+        st.caption(f"Callado igual: «{rule}» está en la lista de no responder (Configuración).")
+    elif on and not pilot.get("reply_to_recruiters", True):
+        st.caption("Callado igual: las respuestas a reclutadores están apagadas para todos (Configuración).")
+
+
 # ---------------- Pipeline ----------------
 with board:
+    if not pilot.get("reply_to_recruiters", True):
+        st.caption("> El agente no responde a ningún reclutador: sigue los correos y actualiza los estados. "
+                   "Se cambia en Configuración → Piloto automático.")
     attention_jobs = [j for j in radar.jobs("action_needed")]
     if attention_jobs:
         st.markdown(f"### [!!] Requieren tu atención · {len(attention_jobs)}")
@@ -450,7 +496,9 @@ with board:
         c1, c2, c3, c4 = row.columns([5, 3, 1.6, 0.9], vertical_alignment="center")
         c1.markdown(f"<div class='row-main'>▸ <b>{j['company'] or 'Empresa sin dato'}</b> — {j['title']}</div>",
                     unsafe_allow_html=True)
-        tags = [{"email": "MAIL", "form": "FORM", "manual": "MANUAL"}.get(j.get("channel"), "")]
+        tags = [{"email": "MAIL", "form": "FORM", "manual": "MANUAL", "inbound": "TE ESCRIBIERON"}.get(j.get("channel"), "")]
+        if stage != "rejected" and agent.conversation_muted(cfg, j):
+            tags.append("BOT CALLADO")
         if j.get("interview_at"):
             tags.append(f"ENTREVISTA {local(j['interview_at'], '%d/%m %H:%M')}")
         kinds = {m["kind"] for m in inbound_by_job.get(j["id"], [])}
@@ -483,6 +531,7 @@ with board:
                                    file_name=Path(j["cv_path"]).name, mime="application/pdf", key=f"cv-{j['id']}")
             if j.get("added_skills"):
                 st.caption("Agregadas a habilidades: " + j["added_skills"])
+            bot_toggle(j)
             st.divider()
             for msg in radar.thread(j["id"]):
                 who = "> YO" if msg["direction"] == "out" else f"< {msg['sender']}"
@@ -495,6 +544,12 @@ with board:
             if st.button("Mover", key=f"movebtn-{j['id']}") and target != stage:
                 radar.set_status(j["id"], target, "Movida a mano")
                 st.rerun()
+            if j["company"]:
+                if agent.banned_company(j["company"], cfg):
+                    st.caption(f"«{j['company']}» está baneada: no se postula a sus ofertas nuevas.")
+                elif st.button(f"Banear «{j['company']}»", key=f"pipe-ban-{j['id']}",
+                               help="No postular nunca más a esta empresa. Esta conversación queda como está."):
+                    ban(j["company"])
 
 
 # ---------------- Postular en LinkedIn ----------------
@@ -557,6 +612,9 @@ with manual_tab:
         if c4.button("Descartar", key=f"manual-skip-{job['id']}", width="stretch"):
             radar.set_status(job["id"], "discarded")
             st.rerun()
+        if job["company"] and c4.button("Banear empresa", key=f"manual-ban-{job['id']}", width="stretch",
+                                        help=f"No postular nunca más a «{job['company']}» (se deshace en Configuración)."):
+            ban(job["company"])
         d1, d2 = row.columns([3, 2])
         with d1.expander("Ver descripción"):
             st.write(job["description"][:4000])
@@ -599,6 +657,10 @@ with offers_tab:
             if job["status"] != "discarded" and c1.button("Descartar", key=f"discard-{job['id']}"):
                 radar.set_status(job["id"], "discarded")
                 st.rerun()
+            if job["company"] and not agent.banned_company(job["company"], cfg) and c1.button(
+                    f"Banear «{job['company']}»", key=f"ban-{job['id']}",
+                    help="No postular nunca más a esta empresa (se deshace en Configuración)."):
+                ban(job["company"])
             if agent.is_manual(job):
                 if job["status"] != "manual" and c1.button("Mover a «Postular en LinkedIn»", key=f"tomanual-{job['id']}"):
                     radar.set_status(job["id"], "manual")
@@ -713,7 +775,9 @@ with tailoring_tab:
             max_years = st.number_input("Máximo de años de experiencia que puede pedir el aviso (0 = sin límite)", 0, 15,
                                         int(ex.get("max_years", 3)),
                                         help="Con 3, se excluye todo aviso que pida 4 años o más (no cuenta si dice «deseable»).")
-            companies = st.text_input("Empresas a excluir (separadas por coma)", ", ".join(ex["companies"]))
+            companies = st.text_input("Empresas baneadas: no se postula nunca a estas (separadas por coma)",
+                                      ", ".join(ex["companies"]),
+                                      help="También se banean con el botón «Banear» en cada oferta. Borrá un nombre para desbanearla.")
             rules = st.text_area("Otras reglas para que Claude descarte ofertas (una por línea)", ex["rules"], height=110,
                                  help="Claude las aplica al leer cada aviso antes de postular.")
             st.markdown("**Nube: solo ecosistema Microsoft**")
@@ -839,10 +903,11 @@ with sources_tab:
                "bumeran": cfg.get("bumeran", {}).get("enabled", False),
                "startupsargentina": cfg.get("startupsargentina", {}).get("enabled", False),
                **{k: cfg.get("remote_boards", {}).get("enabled", False) for k in ("himalayas", "remotive", "jobicy")},
-               "link": True, "linkedin_ext": cfg.get("linkedin_external", {}).get("enabled", True)}
+               "link": True, "linkedin_ext": cfg.get("linkedin_external", {}).get("enabled", True), "contact": True}
     prefixes = {"linkedin_alert": "LinkedIn", "indeed": "Indeed", "getonbrd": "Get on Board",
                 "greenhouse": "greenhouse", "lever": "lever", "computrabajo": "Computrabajo", "bumeran": "Bumeran",
-                "startupsargentina": "Startups Argentina", "himalayas": "Remotos", "remotive": "Remotos", "jobicy": "Remotos", "link": "Link", "linkedin_ext": "LinkedIn externo"}
+                "startupsargentina": "Startups Argentina", "himalayas": "Remotos", "remotive": "Remotos", "jobicy": "Remotos", "link": "Link", "linkedin_ext": "LinkedIn externo",
+                "contact": "Te escribieron"}
     rows = []
     for key, (name, how, apply_how) in radar.SOURCES.items():
         problems = [e for e in errors if e.startswith(prefixes[key])]
@@ -903,27 +968,123 @@ with settings_general:
             check_hours = st.number_input("Revisar correos y ofertas cada (horas)", 1, 24, int(pilot.get("check_every_hours", 4)),
                                           help="Al cambiarlo, la tarea de Windows se reprograma sola.")
             headless = st.toggle("Navegador invisible (headless)", value=pilot.get("browser_headless", False))
+            replies = st.toggle("Responder a reclutadores", value=pilot.get("reply_to_recruiters", True),
+                                help="Apagado, el agente igual lee los correos y actualiza los estados, pero no le escribe a nadie.")
+            sends_followups = st.toggle("Mandar seguimientos", value=pilot.get("followups", True))
+            muted = st.text_area("No escribirle nunca a (un correo, dominio o empresa por línea)",
+                                 "\n".join(pilot.get("muted_contacts", [])), height=100,
+                                 placeholder="ana@consultora.com\nglobant.com\nMercado Libre")
             if st.form_submit_button("Guardar"):
+                hours_changed = int(check_hours) != int(pilot.get("check_every_hours", 4))
                 pilot.update(enabled=enabled, max_applications_per_day=int(per_day),
                              followup_after_days=int(followup), apply_hours=list(ah), reply_hours=list(rh),
-                             check_every_hours=int(check_hours), browser_headless=headless)
+                             check_every_hours=int(check_hours), browser_headless=headless,
+                             reply_to_recruiters=replies, followups=sends_followups,
+                             muted_contacts=[line.strip() for line in muted.splitlines() if line.strip()])
                 save_config(cfg)
                 import os
-                import subprocess
-                if os.name == "nt":  # on Linux the cycle is a systemd timer
-                    subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                                    str(radar.ROOT / "install_task.ps1")], capture_output=True,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                next_run_text.clear()
+                if hours_changed and os.name == "nt":  # on Linux the cycle is a systemd timer
+                    # Re-registering the tasks also re-enables them: only when the interval actually changes.
+                    agent.install_tasks()
+                    scheduler_status.clear()
                 st.success("Guardado")
                 st.rerun()
-        st.subheader("Gmail")
-        if not (radar.SECRETS / "credentials.json").exists():
-            st.warning("Falta .secrets/credentials.json (ver README).")
-        for role, label in (("main", "Principal: postulaciones y reclutadores"),
-                            ("alerts", "Notificaciones: alertas de LinkedIn y avisos del radar")):
+        talks = [j for j in pipeline_jobs if j["status"] in agent.ACTIVE]
+        silenced = sum(not j.get("bot_replies", 1) for j in talks)
+        with st.expander(f"Conversaciones con reclutadores · {len(talks)}"
+                         + (f" · {silenced} sin agente" if silenced else "")):
+            if not talks:
+                st.caption("> Todavía no hay conversaciones activas.")
+            else:
+                if not pilot.get("reply_to_recruiters", True):
+                    st.caption("Las respuestas a reclutadores están apagadas para todos (arriba): "
+                               "estas casillas cuentan recién cuando las prendas.")
+                st.caption("Destildá una fila para que el agente no responda ni haga seguimiento en esa conversación.")
+                rows = [{"Responde": bool(j.get("bot_replies", 1)),
+                         "Empresa": j["company"] or "Empresa sin dato", "Puesto": j["title"],
+                         "Correo": j.get("recipient") or "sin correo", "Estado": STATUSES[j["status"]],
+                         "Nota": (f"en no responder: {rule}" if (rule := agent.muted_contact(
+                             cfg, j.get("recipient") or "", j.get("company") or "")) else "")}
+                        for j in talks]
+                edited = st.data_editor(rows, hide_index=True, width="stretch", # The stored values are part of the key: a change from Pipeline redraws the table fresh.
+                                        key="talks-" + "".join(str(int(r["Responde"])) for r in rows),
+                                        disabled=["Empresa", "Puesto", "Correo", "Estado", "Nota"],
+                                        column_config={"Responde": st.column_config.CheckboxColumn(width="small")})
+                changed = [(j, row["Responde"]) for j, row in zip(talks, edited)
+                           if row["Responde"] != bool(j.get("bot_replies", 1))]
+                if changed:
+                    for j, on in changed:
+                        agent.set_bot_replies(j["id"], on)
+                    st.rerun()
+        st.subheader("Cuentas y Gmail")
+        creds_file = radar.SECRETS / "credentials.json"
+
+        def upload_credentials(upload) -> None:
+            try:
+                data = json.loads(upload.getvalue())
+            except ValueError:
+                st.error("Ese archivo no es un JSON válido.")
+                return
+            if "installed" not in data:
+                st.error("Ese JSON no es un cliente OAuth de tipo «Desktop app» (le falta la clave «installed»).")
+                return
+            radar.SECRETS.mkdir(exist_ok=True)
+            creds_file.write_bytes(upload.getvalue())
+            st.rerun()
+
+        if not creds_file.exists():
+            st.warning("Paso 1: falta la credencial de Google. En Google Cloud Console creá un proyecto, habilitá Gmail API, "
+                       "configurá la pantalla de consentimiento y creá un cliente OAuth «Desktop app». "
+                       "Descargá su JSON y subilo acá (detalle en el README).")
+            if upload := st.file_uploader("Credencial OAuth (credentials.json)", type="json", key="gcreds-new"):
+                upload_credentials(upload)
+        else:
+            with st.expander("Credencial de Google Cloud"):
+                try:
+                    project = json.loads(creds_file.read_text(encoding="utf-8"))["installed"].get("project_id", "?")
+                except (ValueError, KeyError):
+                    project = "archivo inválido"
+                st.caption(f"Proyecto: {project}. Las cuentas que autorices tienen que estar como usuarios de prueba "
+                           "en ese proyecto, o la app publicada («In production») para que no venza cada 7 días.")
+                if upload := st.file_uploader("Reemplazar credentials.json", type="json", key="gcreds-replace"):
+                    upload_credentials(upload)
+
+        accounts = cfg.setdefault("gmail_accounts", {})
+        main_addr = cfg.get("candidate_email", "")
+        alerts_addr = accounts.get("alerts") or main_addr
+        with st.form("accounts"):
+            name = st.text_input("Tu nombre (firma los correos)", cfg.get("candidate_name", ""))
+            new_main = st.text_input("Cuenta principal: desde acá postulás y hablás con reclutadores", main_addr)
+            same = st.toggle("Las alertas de LinkedIn llegan a esta misma cuenta", value=alerts_addr.lower() == main_addr.lower())
+            new_alerts = st.text_input("Cuenta de alertas (solo si es otra)", "" if alerts_addr.lower() == main_addr.lower() else alerts_addr,
+                                       placeholder="otra.cuenta@gmail.com")
+            notify = st.text_input("Mandarme los avisos del agente a", pilot.get("notify_email", ""),
+                                   help="Vacío: el agente no te manda avisos por correo.")
+            if st.form_submit_button("Guardar cuentas"):
+                new_main = new_main.strip()
+                new_alerts = new_main if same or not new_alerts.strip() else new_alerts.strip()
+                if not name.strip() or "@" not in new_main or "@" not in new_alerts:
+                    st.error("Completá tu nombre y correos válidos.")
+                else:
+                    # A token belongs to one account: changing the address means authorizing again.
+                    for role, old, new in (("main", main_addr, new_main), ("alerts", alerts_addr, new_alerts)):
+                        if old.lower() != new.lower():
+                            (radar.SECRETS / radar.GMAIL_TOKENS[role]).unlink(missing_ok=True)
+                    cfg.update(candidate_name=name.strip(), candidate_email=new_main)
+                    accounts.update(main=new_main, alerts=new_alerts)
+                    pilot["notify_email"] = notify.strip()
+                    save_config(cfg)
+                    gmail_expired.clear()
+                    st.rerun()
+
+        roles = [("main", "Principal: postulaciones y reclutadores")]
+        if radar.gmail_token_role("alerts") == "alerts":
+            roles.append(("alerts", "Alertas de LinkedIn y avisos del agente"))
+        else:
+            roles[0] = ("main", "Postulaciones, reclutadores y alertas de LinkedIn")
+        for role, label in roles:
             address = radar.gmail_account(role)
-            state = "sin conectar"
+            state = "sin conectar" if creds_file.exists() else "falta la credencial (paso 1)"
             try:
                 connected = radar.gmail_service(role=role) is not None
             except radar.GmailExpired:
@@ -934,13 +1095,21 @@ with settings_general:
                 st.success(f"{label} · {address} · conectado")
             else:
                 st.warning(f"{label} · {address} · {state}")
-                if st.button(f"Autorizar {address}", key=f"auth-{role}"):
-                    try:
-                        radar.gmail_service(interactive=True, role=role)
-                        gmail_expired.clear()
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(str(exc))
+            c1, c2 = st.columns(2)
+            if c1.button(f"{'Volver a autorizar' if connected else 'Autorizar'} {address}", key=f"auth-{role}",
+                         disabled=not creds_file.exists(), width="stretch",
+                         help="Se abre Google en el navegador: elegí esa cuenta y aceptá los permisos."):
+                try:
+                    radar.gmail_service(interactive=True, role=role, force=connected)
+                    gmail_expired.clear()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+            token = radar.SECRETS / radar.GMAIL_TOKENS[role]
+            if c2.button("Desconectar", key=f"unauth-{role}", disabled=not token.exists(), width="stretch"):
+                token.unlink(missing_ok=True)
+                gmail_expired.clear()
+                st.rerun()
         st.subheader("Navegador del agente")
         st.write("Para formularios y LinkedIn el agente abre un Edge aparte, con su propio perfil, y lo cierra al terminar. "
                  "Iniciá sesión una vez en ese Edge en Indeed, Get on Board, Computrabajo y Bumeran. LinkedIn no se usa: ahí te postulás vos.")
