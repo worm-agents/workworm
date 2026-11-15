@@ -76,6 +76,8 @@ PIPELINE = ("applied", "conversation", "action_needed", "interview", "offer", "r
 LEGACY_STATUS = {"selected": "new", "draft": "new", "sent": "applied", "replied": "conversation", "no_email": "new"}
 # Every platform the radar reads from: how offers arrive and how the agent applies.
 SOURCES = {
+    "contact": ("Te escribieron", "Reclutadores que te escribieron por correo sin que el agente se postulara",
+                "No se postula: sigue la conversación y no responde, salvo que lo actives en esa conversación"),
     "linkedin_alert": ("LinkedIn", "Alertas de empleo recibidas en Gmail + descripción pública del aviso",
                        "Manual: el agente deja el link listo, te postulás vos y él sigue la conversación"),
     "indeed": ("Indeed Argentina", "Búsqueda con JobSpy (scraping del sitio público)",
@@ -164,11 +166,36 @@ def normalize(value: str) -> str:
     return "".join(c for c in value if not unicodedata.combining(c)).lower().strip()
 
 
+_SCHEMA_READY: set[str] = set()
+
+
 @contextmanager
 def connect():
     DB_PATH.parent.mkdir(exist_ok=True)
-    db = sqlite3.connect(DB_PATH)
+    if not DB_PATH.exists():
+        _SCHEMA_READY.discard(str(DB_PATH))
+    # The dashboard (every few seconds) and the agent's cycle share the file: wait for the other
+    # writer instead of failing with "database is locked".
+    db = sqlite3.connect(DB_PATH, timeout=30)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=30000")
+    try:
+        if str(DB_PATH) not in _SCHEMA_READY:
+            _ensure_schema(db)
+            db.commit()
+            _SCHEMA_READY.add(str(DB_PATH))
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _ensure_schema(db: sqlite3.Connection) -> None:
+    """Tables, added columns and status renames. Runs once per process, not on every connection:
+    these writes were what kept locking the database while a cycle was running."""
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript("""
         CREATE TABLE IF NOT EXISTS jobs (
@@ -243,16 +270,14 @@ def connect():
                       ("login_url", "TEXT NOT NULL DEFAULT ''"), ("login_google", "INTEGER NOT NULL DEFAULT 0")):
         if name not in columns:
             db.execute(f"ALTER TABLE applications ADD COLUMN {name} {ddl}")
+    if "bot_replies" not in columns:
+        # 1 = the agent may write to the recruiter in this conversation. The ones it did not start (manual
+        # applications, or where the user already wrote from Gmail) start muted.
+        db.execute("ALTER TABLE applications ADD COLUMN bot_replies INTEGER NOT NULL DEFAULT 1")
+        db.execute("""UPDATE applications SET bot_replies=0 WHERE channel='manual' OR job_id IN
+                      (SELECT job_id FROM messages WHERE direction='out' AND kind='manual' AND job_id IS NOT NULL)""")
     for old, new in LEGACY_STATUS.items():
         db.execute("UPDATE jobs SET status=? WHERE status=?", (new, old))
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
 
 
 def target_role(job: dict) -> bool:
@@ -860,9 +885,16 @@ def parse_linkedin_email(plain: str, sent_at: str = "") -> list[dict]:
 GMAIL_TOKENS = {"main": "token_main.json", "alerts": "token.json"}
 
 
+def gmail_token_role(role: str) -> str:
+    """Role whose token serves this one: when alerts arrive at the main inbox, one authorization covers both."""
+    if role == "alerts" and gmail_account("alerts").lower() == gmail_account("main").lower():
+        return "main"
+    return role
+
+
 def gmail_can_modify(role: str = "main") -> bool:
     """Whether the stored token for that inbox already has the gmail.modify permission."""
-    path = SECRETS / GMAIL_TOKENS[role]
+    path = SECRETS / GMAIL_TOKENS[gmail_token_role(role)]
     return path.exists() and "gmail.modify" in path.read_text(encoding="utf-8")
 
 
@@ -877,7 +909,7 @@ class GmailExpired(RuntimeError):
     """Google revoked the stored token (in Testing mode it lasts 7 days); the user must authorize again."""
 
 
-def gmail_service(interactive: bool = False, role: str = "main"):
+def gmail_service(interactive: bool = False, role: str = "main", force: bool = False):
     """Return an authorized Gmail API service for a role, or None until OAuth is configured for it.
     Raises GmailExpired when the stored token can no longer be refreshed."""
     from google.auth.exceptions import RefreshError
@@ -887,12 +919,14 @@ def gmail_service(interactive: bool = False, role: str = "main"):
     from googleapiclient.discovery import build
 
     credentials_path = SECRETS / "credentials.json"
+    role = gmail_token_role(role)
     token_path = SECRETS / GMAIL_TOKENS[role]
     if not credentials_path.exists():
         return None
     # The main inbox also needs gmail.modify (labels/archive for mail_organizer); older tokens keep their own scopes.
     wanted = SCOPES + (["https://www.googleapis.com/auth/gmail.modify"] if role == "main" else [])
-    creds = Credentials.from_authorized_user_file(str(token_path)) if token_path.exists() else None
+    # force: ask Google again even if the stored token still works (e.g. to switch accounts or renew permissions).
+    creds = Credentials.from_authorized_user_file(str(token_path)) if token_path.exists() and not force else None
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
@@ -1027,7 +1061,8 @@ def jobs(status: str = "all") -> list[dict]:
     """Jobs joined with their application (if any). `status` may be a status, 'pipeline' or 'all'."""
     query = """SELECT j.*, a.recipient, a.subject AS app_subject, a.sent_at, a.thread_id, a.cv_file,
                       a.last_inbound_at, a.last_outbound_at, a.followup_at, a.interview_at,
-                      a.interview_link, a.note, a.channel, a.cv_path, a.added_skills, a.status AS app_status, a.user_input, a.login_url, a.login_google
+                      a.interview_link, a.note, a.channel, a.cv_path, a.added_skills, a.status AS app_status, a.user_input, a.login_url, a.login_google,
+                      a.bot_replies
                FROM jobs j LEFT JOIN applications a ON a.job_id = j.id WHERE 1=1"""
     args: list = []
     if status == "pipeline":

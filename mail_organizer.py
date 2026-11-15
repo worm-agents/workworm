@@ -38,7 +38,7 @@ def label_id(service, name: str) -> str:
 
 
 def is_job_mail(sender: str, subject: str, thread_id: str, known_threads: set[str], known_ids: set[str], msg_id: str) -> bool:
-    if LOGIN_SUBJECT.search(subject or ""):
+    if LOGIN_SUBJECT.search(subject or "") and not JOB_SUBJECT.search(subject or ""):
         return False  # sign-in links and codes stay in the inbox: the user needs them right now
     if msg_id in known_ids or thread_id in known_threads:
         return True
