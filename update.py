@@ -2,6 +2,7 @@
 
 import json
 import socket
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,8 @@ def ensure_dashboard() -> None:
         probe.settimeout(1)
         if probe.connect_ex(("127.0.0.1", 8501)) == 0:
             return
+    if os.name != "nt":
+        return  # on Linux the dashboard is a systemd service
     subprocess.run(["powershell.exe", "-NoProfile", "-Command", "Start-ScheduledTask -TaskName 'WorkWorm - Tablero'"],
                    capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 

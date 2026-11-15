@@ -16,6 +16,28 @@ import llm
 import radar
 from radar import LOCAL_TZ, connect, log_event, normalize, now
 
+
+GMAIL_PAUSE = 0.3  # seconds between Gmail reads: the per-minute quota is what trips, not the daily one
+GMAIL_BATCH = 40   # full-message reads per step and cycle; the rest waits for the next cycle
+
+
+def gmail_exec(request, tries: int = 5):
+    """Run a Gmail request, backing off on the per-minute rate limit (429, 403 rateLimitExceeded) and 5xx."""
+    from googleapiclient.errors import HttpError
+    delay = 2.0
+    for attempt in range(tries):
+        try:
+            result = request.execute()
+            time.sleep(GMAIL_PAUSE)
+            return result
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", 0)
+            limited = status == 429 or status >= 500 or (status == 403 and "ate" in str(exc) and "imit" in str(exc))
+            if not limited or attempt == tries - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
 LOCK = radar.ROOT / "data" / "agent.lock"
 PROGRESS = radar.ROOT / "data" / "progress.json"
 CV_CACHE = radar.ROOT / "data" / "cv_cache.json"
@@ -33,8 +55,10 @@ APPLY_SCHEMA = {
         "cv_id": {"type": "string"},
         "subject": {"type": "string"},
         "body": {"type": "string"},
+        "missing_tech": {"type": "array", "items": {"type": "string"}, "maxItems": 2,
+                         "description": "Hasta 2 tecnologias, lenguajes o servicios que el aviso pide como requisito principal y que NO figuran en el perfil ni el CV. Solo nombres cortos (p. ej. Rust, Spring Boot). Vacio si no hay."},
     },
-    "required": ["should_apply", "reason", "recipient", "language", "cv_id", "subject", "body"],
+    "required": ["should_apply", "reason", "recipient", "language", "cv_id", "subject", "body", "missing_tech"],
 }
 REPLY_SCHEMA = {
     "type": "object",
@@ -104,7 +128,7 @@ def system_prompt(cfg: dict) -> str:
 # ---------- gmail helpers ----------
 
 def build_raw(cfg: dict, to: str, subject: str, body: str, attachment: Path | None = None,
-              reply_to_id: str = "", references: str = "") -> str:
+              reply_to_id: str = "", references: str = "", texts: list | None = None) -> str:
     email = EmailMessage()
     email["To"] = to
     email["From"] = formataddr((cfg["candidate_name"], cfg["candidate_email"]))
@@ -115,6 +139,8 @@ def build_raw(cfg: dict, to: str, subject: str, body: str, attachment: Path | No
     email.set_content(body.strip())
     if attachment:
         email.add_attachment(attachment.read_bytes(), maintype="application", subtype="pdf", filename=attachment.name)
+    for name, text in texts or []:  # guiones de video: adjuntos de texto para abrir o pegar
+        email.add_attachment(text.encode("utf-8"), maintype="text", subtype="plain", filename=name)
     return base64.urlsafe_b64encode(email.as_bytes()).decode("ascii")
 
 
@@ -155,7 +181,7 @@ def plain_text(payload: dict) -> str:
     return "\n".join(line for line in plain.splitlines() if not line.startswith(">")).strip()
 
 
-def notify(service, cfg: dict, subject: str, body: str) -> None:
+def _send_mail(service, cfg: dict, subject: str, body: str, texts: list | None = None) -> None:
     """Radar notices go to the notifications inbox, sent from that same account when it is connected."""
     to = cfg["autopilot"].get("notify_email")
     try:
@@ -165,10 +191,285 @@ def notify(service, cfg: dict, subject: str, body: str) -> None:
     if alerts and to:
         sender = radar.gmail_account("alerts")
         alerts.users().messages().send(userId="me", body={"raw": build_raw({**cfg, "candidate_email": sender}, to,
-                                       f"[WorkWorm] {subject}", body)}).execute()
+                                       f"[WorkWorm] {subject}", body, texts=texts)}).execute()
         return
     if to:
-        send(service, build_raw(cfg, to, f"[WorkWorm] {subject}", body))
+        send(service, build_raw(cfg, to, f"[WorkWorm] {subject}", body, texts=texts))
+
+
+URGENT_SUBJECT = re.compile(r"^(Entrevista|Propuesta)", re.I)
+SECTIONS = [
+    ("register", "Registrarte o iniciar sesión", re.compile(r"^(Creá la cuenta|Iniciá sesión)", re.I)),
+    ("finish", "Terminar y enviar (captcha, test, verificación)", re.compile(r"^Terminá la postulación", re.I)),
+    ("video", "Videos para grabar (con el guion)", re.compile(r"^Guion de video", re.I)),
+    ("reply", "Respuestas o confirmaciones que te piden", re.compile(r"^Necesito tu respuesta", re.I)),
+    ("manual", "No pude postular: a mano o descartar", re.compile(r"^(No pude postular|Falta un dato)", re.I)),
+    ("top", "Borradores de empresas top", re.compile(r"^Empresa top", re.I)),
+]
+DONE_HINT = re.compile(r"completed|submitted|se envi[oó] correctamente|recibimos tu|application received|"
+                       r"hemos recibido|completada|thank you for applying", re.I)
+
+
+def notify(service, cfg: dict, subject: str, body: str) -> None:
+    """Interviews and offers go out at once; everything else waits for the single digest mail at the end of the cycle."""
+    if URGENT_SUBJECT.search(subject):
+        _send_mail(service, cfg, subject, body)
+        return
+    with connect() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS digest_queue (id INTEGER PRIMARY KEY, at TEXT, subject TEXT,
+                      body TEXT, sent INTEGER DEFAULT 0)""")
+        db.execute("UPDATE digest_queue SET at=?, body=? WHERE sent=0 AND subject=?", (now(), body, subject))
+        if not db.execute("SELECT 1 FROM digest_queue WHERE sent=0 AND subject=?", (subject,)).fetchone():
+            db.execute("INSERT INTO digest_queue(at, subject, body) VALUES(?,?,?)", (now(), subject, body))
+
+
+TABS_FILE = radar.ROOT / "data" / "vm_tabs.json"
+FORM_HOSTS = re.compile(r"smartapply\.indeed|recruitee|ashbyhq|lever\.co|greenhouse|teamtailor|breezy|bamboohr|workable|"
+                        r"smartrecruiters|typeform|jotform|forms\.gle|docs\.google\.com/forms|zohorecruit|oraclecloud|"
+                        r"successfactors", re.I)
+
+
+def _cdp(path: str, method: str = "GET"):
+    import urllib.request
+    req = urllib.request.Request(f"http://127.0.0.1:{ASSIST_PORT}{path}", method=method)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def vm_tabs() -> list[dict]:
+    """Pages open in the agent's Chrome (the screen the user sees), most recently used first."""
+    try:
+        data = _cdp("/json/list")
+    except (OSError, ValueError):
+        return []
+    return [{"id": t["id"], "title": t.get("title", ""), "url": t.get("url", "")}
+            for t in data if t.get("type") == "page" and not t.get("url", "").startswith("chrome-untrusted")]
+
+
+def _bare(url: str) -> str:
+    """Host + path + the query without tracking params, to tell two job pages apart (Indeed uses ?jk=)."""
+    from urllib.parse import parse_qsl, urlparse
+    p = urlparse(url or "")
+    query = "&".join(f"{k}={v}" for k, v in parse_qsl(p.query) if not k.startswith("utm_"))
+    return f"{p.netloc}{p.path.rstrip('/')}?{query}".lower() if p.netloc else ""
+
+
+def tab_jobs(tab: dict, pending: list[dict]) -> list[dict]:
+    """Pending offers a tab belongs to: same URL (offer or its login page), else the company name in its title/URL."""
+    bare = _bare(tab["url"])
+    exact = [j for j in pending if bare and bare in (_bare(j["url"]), _bare(j.get("login_url") or ""))]
+    from urllib.parse import unquote
+    jk = re.search(r"jk=([0-9a-f]{10,})", unquote(unquote(tab["url"] or "")))
+    if not exact and jk:
+        exact = [j for j in pending if jk.group(1) in (j["url"] or "") + " " + (j.get("note") or "")]
+    if exact:
+        return exact
+    hay = normalize(tab["title"] + " " + tab["url"])
+    best, best_score = None, 0
+    for j in pending:
+        company = re.split(r"[|,(]", normalize(j["company"]))[0].strip()
+        first = company.split(" ")[0] if company else ""
+        if not (len(company) >= 4 and company in hay or len(first) >= 6 and first in hay):
+            continue
+        score = 1 + sum(1 for w in set(re.findall(r"[a-z0-9]{4,}", normalize(j["title"]))) if w in hay)
+        if score > best_score:
+            best, best_score = j, score
+    return [best] if best else []
+
+
+def sync_vm_tabs(wanted: list[dict], dry_run: bool = False) -> list[dict] | None:
+    """Make the agent's screen show what waits for the user: open a tab for each wanted page that has none, close the tabs
+    that belong to nothing pending (forms in progress are never closed), and return the kept tabs in tab-strip order.
+    Chrome does not tell the strip order, so it is kept in data/vm_tabs.json: known tabs keep their place and new
+    ones go to the end, as Chrome does."""
+    if IS_WINDOWS:
+        return None
+    ensure_browser()
+    if not browser_up():
+        return None
+    from urllib.parse import quote
+    with connect() as db:
+        pending = [dict(r) for r in db.execute(
+            """SELECT j.id, j.company, j.title, j.url, a.note, a.login_url FROM jobs j
+               LEFT JOIN applications a ON a.job_id=j.id WHERE j.status='action_needed'""")]
+    try:
+        state = json.loads(TABS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    owned = state.get("owned", {})
+    tabs = vm_tabs()
+    urls = {k: v for k, v in state.get("urls", {}).items()}
+    dismissed = set(state.get("dismissed", []))
+    open_bare = {_bare(t["url"]) for t in tabs}
+    present_now = {t["id"] for t in tabs}
+    for tid, u in list(urls.items()):  # el usuario cerró una pestaña que abrí yo: no la vuelvo a abrir
+        if tid not in present_now and _bare(u) not in open_bare:
+            dismissed.add(_bare(u))
+        if tid not in present_now:
+            urls.pop(tid, None)
+    holds = {t for h in active_holds() for t in h.get("tabs", [])}
+    opened: list[str] = []
+    for w in wanted:
+        url = w.get("url") or ""
+        if not url.startswith("http") or any(_bare(t["url"]) == _bare(url) for t in tabs) or _bare(url) in dismissed:
+            continue
+        if dry_run:
+            opened.append("NEW:" + url)
+            continue
+        try:
+            made = _cdp("/json/new?" + quote(url, safe=":/?&=%#"), "PUT")
+        except (OSError, ValueError):
+            continue
+        tabs.append({"id": made["id"], "title": made.get("title", ""), "url": url})
+        opened.append(made["id"])
+        urls[made["id"]] = url
+        owned[made["id"]] = [w["job_id"]] if w.get("job_id") else []
+        for other in wanted:  # one login page can serve several offers
+            if other is not w and other.get("job_id") and _bare(other.get("url") or "") == _bare(url):
+                owned[made["id"]].append(other["job_id"])
+    for t in tabs:
+        by_id = [j for j in pending if j["id"] in owned.get(t["id"], [])]
+        t["jobs"] = by_id or tab_jobs(t, pending)
+        t["keep"] = bool(t["jobs"]) or t["id"] in holds or t["id"] in opened or bool(FORM_HOSTS.search(t["url"]))
+    # Chrome compartido con otras herramientas: solo se cierran las pestañas que abrió WorkWorm (owned), nunca las del usuario.
+    drop = [t for t in tabs if not t["keep"] and t["id"] in owned]
+    kept = [t for t in tabs if t["keep"]]
+    present = {t["id"] for t in kept}
+    order = [i for i in state.get("order", []) if i in present]
+    order += [t["id"] for t in reversed(kept) if t["id"] not in order and t["id"] not in opened]
+    order += [i for i in opened if i in present]
+    by_id = {t["id"]: t for t in kept}
+    if dry_run:
+        return [{"closed": t["title"][:50] + " | " + t["url"][:60]} for t in drop] + [by_id[i] for i in order if i in by_id]
+    if kept or len(tabs) > len(drop):  # never leave the browser without a page
+        for t in drop:
+            try:
+                _cdp(f"/json/close/{t['id']}")
+            except (OSError, ValueError):
+                pass
+    TABS_FILE.write_text(json.dumps({"order": order, "owned": {i: v for i, v in owned.items() if i in present},
+                                     "urls": {i: v for i, v in urls.items() if i in present},
+                                     "dismissed": sorted(dismissed)[-200:]}), encoding="utf-8")
+    if opened:
+        try:
+            _cdp(f"/json/activate/{opened[0]}")
+        except (OSError, ValueError):
+            pass
+    return [by_id[i] for i in order]
+
+
+def _short(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def send_digest(service, cfg: dict, report: dict | None = None, dry_run: bool = False, touch_tabs: bool = True):
+    """One mail that mirrors the agent's screen: one numbered entry per open tab, in tab-strip order, saying what the user
+    has to do there; what has no tab (videos, drafts) goes after. The tabs are synced first: a page is opened for each
+    new item and the ones that belong to nothing pending are closed. Drops items whose job already got a
+    «completed / received» mail. Returns how many items it listed (the mail body with dry_run)."""
+    with connect() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS digest_queue (id INTEGER PRIMARY KEY, at TEXT, subject TEXT,
+                      body TEXT, sent INTEGER DEFAULT 0)""")
+        rows = [dict(r) for r in db.execute("SELECT * FROM digest_queue WHERE sent=0 ORDER BY id")]
+        jobs = [dict(r) for r in db.execute(
+            "SELECT j.id, j.company, j.title, j.url, a.login_url FROM jobs j LEFT JOIN applications a ON a.job_id=j.id "
+            "WHERE j.updated_at > datetime('now','-30 days')")]
+    if not rows:
+        return "" if dry_run else 0
+    entries, used = [], []
+    for r in rows:
+        used.append(r["id"])
+        subj = r["subject"]
+        job = next((j for j in jobs if len(normalize(j["company"])) >= 3 and normalize(j["company"]) in normalize(subj)), None)
+        key = next((k for k, _, rx in SECTIONS if rx.search(subj)), "other")
+        url = ""
+        if job and key in ("register", "reply", "manual"):
+            url = job["url"]
+            if key == "register" and job.get("login_url"):
+                url = job["login_url"]
+            if key == "reply":
+                with connect() as db:
+                    last = db.execute("""SELECT body FROM messages WHERE job_id=? AND direction='in'
+                                         ORDER BY at DESC LIMIT 1""", (job["id"],)).fetchone()
+                    done = db.execute("""SELECT 1 FROM messages WHERE job_id=? AND direction='in' AND at > datetime('now','-3 days')
+                                         AND (body LIKE '%completed%' OR body LIKE '%submitted%' OR body LIKE '%correctamente%'
+                                              OR body LIKE '%recibimos%' OR body LIKE '%received%' OR body LIKE '%completada%')""",
+                                      (job["id"],)).fetchone()
+                if done:
+                    continue
+                link = FORM_LINK.search(last["body"] or "") if last else None
+                url = link.group(0).rstrip(".,;") if link else url
+        body = r["body"].strip().replace(
+            "En WorkWorm → Pipeline → Tu atención: «Abrir en el Edge del agente», creá la cuenta con",
+            "La pestaña ya está abierta en la pantalla del agente: creá la cuenta con").replace(
+            "(o entrá con Google), cerrá la ventana y tocá «Listo, reintentar».",
+            "(o entrá con Google) y tocá «Listo, reintentar» en el tablero.")
+        if key != "video":
+            body = _short(body, 700)
+        entries.append({"subj": subj, "key": key, "job": job, "url": url, "body": body})
+    try:
+        tabs = sync_vm_tabs([{"job_id": e["job"]["id"] if e["job"] else None, "url": e["url"]} for e in entries if e["url"]],
+                            dry_run=not touch_tabs)
+    except Exception as exc:
+        tabs = None
+        if report is not None:
+            report.setdefault("errors", []).append(f"pestañas de la pantalla: {exc}")
+    tab_parts, used_entries, n = [], set(), 0
+    for t in tabs or []:
+        if "closed" in t:
+            continue
+        n += 1
+        mine = [(i, e) for i, e in enumerate(entries) if e["job"] and e["job"]["id"] in {j["id"] for j in t.get("jobs", [])}]
+        used_entries.update(i for i, _ in mine)
+        if t.get("jobs"):
+            label = "; ".join(f"{j['company']}: {j['title']}" for j in t["jobs"][:3])
+        else:
+            label = f"{(t['title'] or 'sin título')[:70]} ({radar.urlparse(t['url']).netloc})"
+        lines = [f"Pestaña {n} · {label}"]
+        if mine:
+            lines += [_short(e["body"], 700) for _, e in mine]
+        elif t.get("jobs"):
+            lines.append(_short(t["jobs"][0].get("note") or "", 500))
+        else:
+            debug_log(None, f"pestaña {n} sin oferta asociada: {t.get('url', '')}")
+            lines.append("No pude asociarla a una oferta. Link: " + t.get("url", ""))
+        tab_parts.append("\n".join(lines))
+    listed: dict[str, list[str]] = {key: [] for key, _, _ in SECTIONS}
+    listed["other"] = []
+    for i, e in enumerate(entries):
+        if i in used_entries:
+            continue
+        head = e["subj"] + (f"\n{e['job']['url']}" if e["job"] and e["job"]["url"] and e["job"]["url"] not in e["body"] else "")
+        listed[e["key"]].append(f"• {head}\n{e['body']}")
+    total = len(tab_parts) + sum(len(v) for v in listed.values())
+    if not dry_run:
+        with connect() as db:
+            db.executemany("UPDATE digest_queue SET sent=1 WHERE id=?", [(i,) for i in used])
+    if not total:
+        return "" if dry_run else 0
+    parts = []
+    if tab_parts:
+        parts.append(f"== En la pantalla del agente, de izquierda a derecha ({len(tab_parts)} pestañas) ==\n\n"
+                     + "\n\n".join(tab_parts))
+    for key, title, _ in SECTIONS + [("other", "Otros avisos", None)]:
+        if listed[key]:
+            parts.append(f"== Sin pestaña · {title} ({len(listed[key])}) ==\n\n" + "\n\n".join(listed[key]))
+    body = "\n\n".join(parts) + ("\n\n" + screen_links() if screen_links() else "")
+    if dry_run:
+        return body
+    scripts = []
+    for i, e in enumerate(e for e in entries if e["key"] == "video"):
+        name = re.sub(r"[^A-Za-z0-9]+", "-", e["subj"])[:50].strip("-") or f"guion-{i + 1}"
+        scripts.append((f"{name}.txt", f"{e['subj']}\n\n{e['body']}"))
+    _send_mail(service, cfg, f"Pendientes tuyos: {total}", body, texts=scripts)
+    if report is not None:
+        report["digest"] = total
+    return total
 
 
 def mail_link(thread_id: str) -> str:
@@ -229,7 +530,8 @@ def decide(job: dict, cfg: dict, hint: str) -> dict:
                      if lang else "Escribí en el idioma del aviso (language: es o en) y usá el CV de ese idioma. ")
     prompt = (
         "Prepará la postulación a esta oferta y verificá si cae en alguna exclusión.\n"
-        "should_apply=true SIEMPRE que el rol sea de datos (Data/Analytics Engineer, ETL, BI técnico) y no cumpla "
+        "should_apply=true SIEMPRE que el rol sea de datos o IA (Data/Analytics Engineer, Data Scientist, ML/AI/LLM "
+        "Engineer, MLOps, Forward Deployed, ETL, BI técnico) y no cumpla "
         "ninguna de estas exclusiones definidas por el candidato:\n" + exclusions(cfg)["rules"] + "\n"
         "IMPORTANTE: tu filtro son SOLO esas exclusiones. No evalúes si el candidato encaja, no compares sus años de "
         "experiencia con los pedidos (salvo la regla de años de arriba) ni descartes por tecnologías que no tenga. "
@@ -296,17 +598,51 @@ def record_sent(job: dict, channel: str, decision: dict, gmail_id: str, thread_i
         log_event(db, job["id"], "applied", summary)
 
 
+def _build_projects(job: dict, cfg: dict, decision: dict) -> list[dict]:
+    """If the offer asks for technologies the profile lacks, build a real prototype for each (see projects.py)."""
+    import projects
+    built = []
+    for tech in decision.get("missing_tech") or []:
+        try:
+            record = projects.build(tech, cfg)
+        except Exception as exc:  # never let a project failure block the application
+            with connect() as db:
+                log_event(db, job["id"], "project_error", f"No se pudo armar el proyecto de {tech}: {exc}")
+            continue
+        if record:
+            built.append(record)
+            with connect() as db:
+                log_event(db, job["id"], "project_built", f"Proyecto en {tech}: {record['repo_url']}")
+    return built
+
+
 def apply(service, job: dict, cfg: dict, recipient_hint: str = "", force: bool = False) -> str:
     """Decide with the LLM and apply by email or, when there is no email, through the web form.
     Returns 'applied', 'skipped', 'blocked', 'action_needed', 'failed', 'new' or 'login_required:<site>'."""
     if is_manual(job):
         return "manual"  # LinkedIn: never applied automatically.
+    if radar.blocked_aggregator(job.get("url", "")) and not job.get("contact_email"):
+        # Indeed and Himalayas show Cloudflare to the server's browser: go straight to the employer's form.
+        direct = radar.employer_url(job)
+        if direct:
+            radar.set_url(job["id"], direct)
+            job = {**job, "url": direct}
     reason = excluded(job, cfg) if job["source"] != "link" else ""
+    if not reason:
+        with connect() as db:
+            twin = radar.already_applied_elsewhere(db, job)
+        if twin:
+            reason = (f"Es el mismo aviso que ya postulaste desde {twin['source']} "
+                      f"({twin['title']} · {twin['company']}): no se postula dos veces.")
     if reason:
         radar.set_status(job["id"], "skipped", reason)
         return "skipped"
     hint = recipient_hint or job.get("contact_email") or ""
     decision = decide(job, cfg, hint)
+    if decision.get("should_apply") or recipient_hint:
+        built = _build_projects(job, cfg, decision)
+        if built:
+            decision = decide(job, cfg, hint)  # the profile now lists the new project(s)
     force = force or job["source"] == "link"  # Links the user added are always applied to.
     if not decision["should_apply"] and not recipient_hint and not force:
         radar.set_status(job["id"], "skipped", decision["reason"])
@@ -359,6 +695,39 @@ FORM_SCHEMA = {
     "required": ["status", "reason", "site", "final_url", "login_url", "login_google", "answers"],
 }
 
+FORM_FACTS = (
+    "\nREGLAS PARA COMPLETAR (obligatorias):\n"
+    "- Completá TODAS las casillas del formulario, no solo las obligatorias: si hay un campo, rellenalo con la mejor "
+    "respuesta verdadera según el perfil y el CV. Antes de enviar o de dejar listo, recorré el formulario de arriba "
+    "abajo y verificá que no quede ninguna casilla, lista, radio o checkbox vacía.\n"
+    "- Solo si un dato es imposible de deducir del perfil, dejalo y listalo en la razón.\n"
+    "- La pestaña que dejes abierta tiene que ser el formulario de la EMPRESA en su último paso, con todo cargado y el "
+    "botón de enviar visible. Nunca dejes abierta la ficha de la oferta en Himalayas, Indeed, LinkedIn u otro agregador: "
+    "si «Apply» te lleva a otra web (lever, greenhouse, ashby...), seguí hasta ahí, completá todo y dejá esa pestaña. "
+    "Cerrá solo las pestañas auxiliares que abriste vos.\n"
+    "- Antes de dejarlo, releé cada campo ya cargado (por ejemplo el país del pasaporte) y completá lo que haya "
+    "quedado vacío. Si al volver a mirar el formulario está vacío, cargalo de nuevo.\n"
+    "- No menciones pasos, verificaciones ni bloqueos (por ejemplo Cloudflare) que no viste en la pantalla.\n")
+
+
+def personal_form_rules() -> str:
+    """Reglas propias del usuario para los formularios (config.json → personal.form_rules)."""
+    rules = radar.personal("form_rules")
+    return ("\nREGLAS DEL CANDIDATO (mandan sobre las de arriba):\n" + rules.strip() + "\n") if rules else ""
+
+
+def screen_links(prefix: str = "") -> str:
+    """Links a la pantalla del agente y al tablero, si el usuario los configuró."""
+    screen, board = radar.personal("screen_url"), radar.personal("dashboard_url")
+    return "".join([f"{prefix}Pantalla del agente: {screen}" if screen else "",
+                    f"\n{prefix}Tablero: {board}" if board else ""])
+
+
+def cv_upload_name(cfg: dict) -> str:
+    import unicodedata
+    name = "".join(c for c in unicodedata.normalize("NFKD", cfg.get("candidate_name", "")) if not unicodedata.combining(c))
+    return radar.personal("cv_upload_name") or f"CV {' '.join(name.split()[:1] + name.split()[-1:])}".strip()
+
 
 def upload_copy(cv: dict) -> Path:
     """ASCII-named copy of the CV for uploads (some forms choke on accents)."""
@@ -373,8 +742,163 @@ def upload_copy(cv: dict) -> Path:
     return target
 
 
+IS_WINDOWS = os.name == "nt"
+
+
+def browser_exe() -> str:
+    """The agent's browser: Edge on Windows, Google Chrome on Linux (no Edge for arm64)."""
+    if IS_WINDOWS:
+        return str(Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+                   / "Microsoft/Edge/Application/msedge.exe")
+    import shutil
+    return shutil.which("google-chrome") or "/usr/bin/google-chrome"
+
+
+def browser_up() -> bool:
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{ASSIST_PORT}/json/version", timeout=1)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_browser() -> None:
+    """Linux: the agent's Chrome is the systemd service `workworm-browser` (profile with the logins, CDP on
+    ASSIST_PORT), always on, so forms left for the user survive cycles."""
+    import subprocess
+    if browser_up():
+        return
+    subprocess.run(["systemctl", "--user", "start", "chrome"], capture_output=True)
+    for _ in range(30):
+        if browser_up():
+            return
+        time.sleep(1)
+
+
+def cdp_open(url: str) -> bool:
+    """Open `url` as a new tab in the agent's Chrome (CDP, PUT as recent Chrome requires)."""
+    import urllib.parse
+    import urllib.request
+    ensure_browser()
+    req = urllib.request.Request(f"http://127.0.0.1:{ASSIST_PORT}/json/new?{urllib.parse.quote(url, safe='')}", method="PUT")
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except OSError:
+        return False
+
+
+def open_script_tabs(job: dict, script: str) -> None:
+    """The application can't be finished by the agent (video, etc.): leave the offer and, in the next tab, Google
+    Translate with the script the user should say."""
+    import urllib.parse
+    if not any(h["job_id"] == job["id"] for h in active_holds()):
+        cdp_open(job["url"])
+    text = urllib.parse.quote(script[:4500], safe="")
+    cdp_open(f"https://translate.google.com/?sl=auto&tl=es&text={text}&op=translate")
+
+
+VERIFY_SUBJECT = re.compile(r"verif|confirm|activa|validat|valida|one[- ]time|complete your (registration|sign ?up)", re.I)
+VERIFY_LINK = re.compile(r"https?://[^\s<>\"')\]]+", re.I)
+VERIFY_URL_HINT = re.compile(r"verif|confirm|activat|validat|token|magic|callback|auth", re.I)
+VERIFY_URL_SKIP = re.compile(r"unsubscribe|optout|opt-out|privacy|terms|preferences|\.(png|jpe?g|gif)(\?|$)", re.I)
+
+
+def verify_emails(service, cfg: dict, report: dict) -> None:
+    """Open the e-mail verification link of the last 2 days when the mail comes from a company we applied to."""
+    with connect() as db:
+        companies = [(r["id"], r["company"]) for r in db.execute(
+            """SELECT j.id, j.company FROM jobs j JOIN applications a ON a.job_id=j.id
+               WHERE a.updated_at > datetime('now','-14 days')""")]
+        db.execute("CREATE TABLE IF NOT EXISTS verify_done (gmail_id TEXT PRIMARY KEY)")
+        done = {r["gmail_id"] for r in db.execute("SELECT gmail_id FROM verify_done")}
+    if not companies:
+        return
+    q = "newer_than:2d -in:sent -in:spam -in:trash (verify OR verification OR confirm OR confirmar OR verificar OR activate OR validate)"
+    listing = gmail_exec(service.users().messages().list(userId="me", q=q, maxResults=25))
+    for item in listing.get("messages", []):
+        if item["id"] in done:
+            continue
+        message = gmail_exec(service.users().messages().get(userId="me", id=item["id"], format="full"))
+        subject = header(message, "Subject")
+        sender = header(message, "From")
+        body = plain_text(message["payload"])
+        if not VERIFY_SUBJECT.search(subject + " " + body[:400]):
+            continue
+        hay = normalize(sender + " " + subject + " " + body[:2500])
+        job_id = next((i for i, c in companies if len(normalize(c)) >= 3 and normalize(c) in hay), None)
+        if job_id is None:
+            continue
+        links = [u.rstrip(".,;") for u in VERIFY_LINK.findall(body) if VERIFY_URL_HINT.search(u) and not VERIFY_URL_SKIP.search(u)]
+        if not links:
+            continue
+        opened = cdp_open(links[0])
+        with connect() as db:
+            db.execute("INSERT OR IGNORE INTO verify_done(gmail_id) VALUES(?)", (item["id"],))
+            log_event(db, job_id, "verify_mail", (links[0][:300] if opened else "no se pudo abrir: " + links[0][:300]))
+        if opened:
+            report.setdefault("verified_mails", []).append(subject[:60])
+
+
+def open_tab_ids() -> list[str]:
+    import urllib.request
+    try:
+        data = json.load(urllib.request.urlopen(f"http://127.0.0.1:{ASSIST_PORT}/json/list", timeout=3))
+    except (OSError, ValueError):
+        return []
+    return [t["id"] for t in data if t.get("type") == "page"]
+
+
+def heal_holds() -> int:
+    """A form left for the user whose tabs are all gone (someone or something closed them): forget the hold and the
+    «assist» mark so the next assist rebuilds it. Returns how many were rebuilt-to-be."""
+    if IS_WINDOWS or not browser_up():
+        return 0
+    present = set(open_tab_ids())
+    lost = [h for h in active_holds() if h.get("tabs") and not present & set(h["tabs"])]
+    for h in lost:
+        clear_hold(h["job_id"])
+        with connect() as db:
+            db.execute("DELETE FROM events WHERE kind='assist' AND job_id=?", (h["job_id"],))
+            log_event(db, h["job_id"], "assist_lost", "Se cerró la pestaña del formulario: se vuelve a preparar")
+    return len(lost)
+
+
+def browser_busy():
+    """Windows only: the agent's Edge is killed before each form, so a form left for the user blocks the others.
+    On Linux the browser is shared (new tab per form) and nothing blocks."""
+    return hold_info() if IS_WINDOWS else None
+
+
+def launch_agent_browser(*extra: str) -> None:
+    """Start the agent's visible browser on its own profile (never the user's)."""
+    import subprocess
+    if not IS_WINDOWS:
+        ensure_browser()
+        pages = [x for x in extra if not x.startswith("--") and x != "about:blank"]
+        if pages:  # same profile: Chrome hands the URLs to the running instance as new tabs
+            subprocess.Popen([browser_exe(), f"--user-data-dir={EDGE_PROFILE}", *pages],
+                             env={**os.environ, "DISPLAY": ":1"}, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    EDGE_PROFILE.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    if not IS_WINDOWS:
+        env.setdefault("DISPLAY", ":1")
+    subprocess.Popen([browser_exe(), f"--user-data-dir={EDGE_PROFILE}", "--no-first-run",
+                      "--no-default-browser-check", *extra], env=env,
+                     **({} if IS_WINDOWS else {"start_new_session": True, "stdout": subprocess.DEVNULL,
+                                               "stderr": subprocess.DEVNULL}))
+
+
 def mcp_config(cfg: dict) -> Path:
-    args = ["-y", PLAYWRIGHT_MCP, "--browser", "msedge", "--user-data-dir", str(EDGE_PROFILE),
+    if IS_WINDOWS:
+        browser = ["--browser", "msedge", "--user-data-dir", str(EDGE_PROFILE)]
+    else:
+        ensure_browser()
+        browser = ["--cdp-endpoint", f"http://127.0.0.1:{ASSIST_PORT}"]
+    args = ["-y", PLAYWRIGHT_MCP, *browser,
             "--allow-unrestricted-file-access", "--output-dir", str(radar.ROOT / "data" / "pw-output"),
             "--viewport-size", "1280,900"]
     if cfg["autopilot"].get("browser_headless"):
@@ -385,9 +909,75 @@ def mcp_config(cfg: dict) -> Path:
     return path
 
 
-def close_agent_edge() -> None:
-    """Kill any Edge left running on the agent's profile; the user's own Edge is untouched."""
+HOLD = radar.ROOT / "data" / "edge_hold.json"
+
+
+def _read_holds() -> list[dict]:
+    try:
+        data = json.loads(HOLD.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    items = data.get("holds") if isinstance(data, dict) and "holds" in data else [data]
+    now_dt = datetime.now(timezone.utc)
+    live = []
+    for item in items:
+        until = radar.parse_time(item.get("until", "")) if isinstance(item, dict) else None
+        if until and until > now_dt:
+            live.append({"job_id": item.get("job_id"), "until": item["until"], "until_dt": until,
+                         "tabs": item.get("tabs") or []})
+    return live
+
+
+def _write_holds(holds: list[dict]) -> None:
+    if not holds:
+        HOLD.unlink(missing_ok=True)
+        return
+    HOLD.write_text(json.dumps({"holds": [{"job_id": h["job_id"], "until": h["until"], "tabs": h.get("tabs") or []}
+                                          for h in holds]}),
+                    encoding="utf-8")
+
+
+def active_holds() -> list[dict]:
+    """Forms left filled for the user (captcha, video...), each in its own tab of the agent's Edge.
+    A hold ends when the offer leaves «Requiere tu atención» (applied, discarded) or when it expires."""
+    holds = _read_holds()
+    if holds:
+        with connect() as db:
+            waiting = {r["id"] for r in db.execute("SELECT id FROM jobs WHERE status='action_needed'")}
+        holds = [h for h in holds if h["job_id"] in waiting or h["job_id"] is None]
+    _write_holds(holds)  # drops the expired ones
+    return holds
+
+
+def hold_info() -> dict | None:
+    """While any hold lasts, cycles don't close the agent's Edge and don't apply through web forms.
+    Returns the one that expires first."""
+    holds = active_holds()
+    return min(holds, key=lambda h: h["until_dt"]) if holds else None
+
+
+def set_hold(job_id: int, minutes: int, tabs: list[str] | None = None) -> datetime:
+    until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    holds = [h for h in active_holds() if h["job_id"] != job_id]
+    holds.append({"job_id": job_id, "until": until.isoformat(timespec="seconds"), "until_dt": until,
+                  "tabs": tabs or []})
+    _write_holds(holds)
+    return until
+
+
+def clear_hold(job_id: int | None = None) -> None:
+    holds = active_holds()
+    _write_holds([h for h in holds if job_id is not None and h["job_id"] != job_id])
+
+
+def close_agent_edge(force: bool = False) -> None:
+    """Kill any Edge left running on the agent's profile; the user's own Edge is untouched.
+    A form left for the user (see hold_info) is kept open unless force=True."""
     import subprocess
+    if not force and hold_info():
+        return
+    if not IS_WINDOWS:
+        return  # Linux: the agent's Chrome is never closed (it holds the forms waiting for the user)
     script = ("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
               f"Where-Object {{ $_.CommandLine -like '*{radar.ROOT.name}*edge-profile*' }} | "
               "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
@@ -401,13 +991,10 @@ LOGIN_PAGES = ("https://secure.indeed.com/auth", "https://www.getonbrd.com/login
 
 def open_agent_edge(urls: tuple[str, ...] = LOGIN_PAGES) -> None:
     """Open the agent's Edge profile so the user can sign in once (Indeed, Get on Board...)."""
-    import subprocess
-    EDGE_PROFILE.mkdir(parents=True, exist_ok=True)
-    edge = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe"
-    subprocess.Popen([str(edge), f"--user-data-dir={EDGE_PROFILE}", "--no-first-run", *urls])
+    launch_agent_browser(*urls)
 
 
-ASSIST_PORT = 9333
+ASSIST_PORT = 9222  # Chrome del usuario (CDP); WorkWorm no abre un Chrome propio
 ASSIST_SCHEMA = {
     "type": "object",
     "properties": {"ready": {"type": "boolean"}, "detail": {"type": "string"}},
@@ -415,7 +1002,7 @@ ASSIST_SCHEMA = {
 }
 
 
-def assist_form(job_id: int, cfg: dict) -> dict:
+def assist_form(job_id: int, cfg: dict, url: str = "", instruction: str = "") -> dict:
     """Fill the application form in a visible Edge and stop before submitting, leaving the window open so the
     user can solve the captcha and press submit. Returns {ready, detail}."""
     import subprocess
@@ -428,34 +1015,118 @@ def assist_form(job_id: int, cfg: dict) -> dict:
     if not cv_path:
         cv = cv_for(cfg, application_language(job, cfg, ""))
         cv_path = str(upload_copy(cv))
-    close_agent_edge()
-    edge = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe"
-    subprocess.Popen([str(edge), f"--user-data-dir={EDGE_PROFILE}", f"--remote-debugging-port={ASSIST_PORT}",
-                      "--no-first-run", "about:blank"])
-    for _ in range(30):  # wait for the debugging endpoint
+    def debugging_up() -> bool:
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{ASSIST_PORT}/json/version", timeout=1)
-            break
+            return True
         except OSError:
+            return False
+
+    # Other forms are waiting in this Edge: keep it, and work in a NEW tab so they (and their uploads) survive.
+    reuse = bool(active_holds()) and debugging_up()
+    if not reuse:
+        close_agent_edge(force=True)
+        launch_agent_browser(f"--remote-debugging-port={ASSIST_PORT}", "about:blank")
+        for _ in range(30):  # wait for the debugging endpoint
+            if debugging_up():
+                break
             time.sleep(1)
+    tabs_before = set(open_tab_ids())
     config = radar.ROOT / "data" / "mcp_assist.json"
     config.write_text(json.dumps({"mcpServers": {"playwright": {"command": "npx", "args": [
         "-y", PLAYWRIGHT_MCP, "--cdp-endpoint", f"http://127.0.0.1:{ASSIST_PORT}", "--allow-unrestricted-file-access",
         "--output-dir", str(radar.ROOT / "data" / "pw-output")]}}}), encoding="utf-8")
     prompt = (
         f"Completá la postulación a esta oferta en nombre de {cfg['candidate_name']} usando el navegador, pero NO la envíes.\n"
-        f"Oferta: {job['title']} — {job['company']}\nURL: {job['url']}\nCV para subir (ruta absoluta): {cv_path}\n"
+        f"Oferta: {job['title']} — {job['company']}\nURL: {url or job['url']}\nCV para subir (ruta absoluta): {cv_path}\n"
+        + (f"ESTE ES UN FORMULARIO O CUESTIONARIO QUE MANDÓ EL RECLUTADOR por mail (resumen: {instruction}). "
+           "Respondé cada pregunta con la verdad según el perfil y el CV; si una respuesta no se puede sacar del perfil, "
+           "dejala sin completar y listala en detail.\n" if instruction else "")
+        +
         f"Carta de presentación:\n{letter}\n\n"
         f"Texto del CV:\n{cv_texts(cfg).get(cv_for(cfg, application_language(job, cfg, ''))['id'], '')}\n\n"
-        "Abrí la URL en la pestaña actual, pulsá «Apply/Postularme», completá todos los campos y subí el CV. "
-        "Dejá todo listo en el último paso con el botón de envío visible. NO pulses enviar ni resuelvas captchas: "
-        "eso lo hace el candidato. No cierres la pestaña ni el navegador. ready=true si quedó listo para enviar.")
+        "Abrí la URL en una PESTAÑA NUEVA (no toques ni cierres las otras pestañas: hay formularios de otras ofertas esperando al candidato), pulsá «Apply/Postularme», completá todos los campos y subí el CV desde la ruta indicada. "
+        "Dejá todo listo en el último paso con el botón de envío visible y confirmá que el CV figura adjunto. "
+        "NO pulses enviar ni resuelvas captchas: eso lo hace el candidato. No cierres ninguna pestaña ni el navegador. "
+        "ready=true si quedó listo para enviar." + FORM_FACTS + personal_form_rules())
     try:
-        return llm.ask(system_prompt(cfg), prompt, ASSIST_SCHEMA, model=cfg["autopilot"].get("model", "sonnet"),
-                       timeout=int(cfg["autopilot"].get("form_timeout_minutes", 15)) * 60,
-                       extra=["--mcp-config", str(config), "--strict-mcp-config", "--allowedTools", "mcp__playwright"])
+        result = llm.ask(system_prompt(cfg), prompt, ASSIST_SCHEMA, model=cfg["autopilot"].get("model", "sonnet"),
+                         timeout=int(cfg["autopilot"].get("form_timeout_minutes", 15)) * 60,
+                         extra=["--mcp-config", str(config), "--strict-mcp-config", "--allowedTools", "mcp__playwright",
+                                "--disallowedTools", "mcp__playwright__browser_close"])
     except llm.LLMError as exc:
         return {"ready": False, "detail": str(exc)}
+    if result["ready"]:
+        # Keep the window alive across cycles until the user finishes it (or the hold expires).
+        new_tabs = [t for t in open_tab_ids() if t not in tabs_before]
+        result["until"] = set_hold(job_id, int(cfg["autopilot"].get("hold_minutes", 180)), tabs=new_tabs)
+    return result
+
+
+FORM_LINK = re.compile(r"https?://[^\s<>\")]*(?:teamtailor|workable|typeform|jotform|forms\.gle|docs\.google\.com/forms|"
+                       r"bamboohr|recruitee|breezy|ashbyhq|lever\.co|greenhouse|smartrecruiters|zohorecruit)[^\s<>\")]*", re.I)
+
+
+def recruiter_forms() -> list[dict]:
+    """Offers waiting on a questionnaire or form link that a recruiter mailed (not a video, not an account)."""
+    out = []
+    with connect() as db:
+        rows = [dict(r) for r in db.execute(
+            """SELECT j.*, a.note FROM jobs j JOIN applications a ON a.job_id=j.id
+               WHERE j.status='action_needed'
+               AND j.id NOT IN (SELECT job_id FROM events WHERE kind='assist' AND job_id IS NOT NULL)""")]
+        for r in rows:
+            m = db.execute("""SELECT body, summary, kind FROM messages WHERE job_id=? AND direction='in'
+                              ORDER BY at DESC LIMIT 1""", (r["id"],)).fetchone()
+            if not m or m["kind"] not in ("question", "other") or re.search(r"video|spark ?hire|hirevue", m["body"] or "", re.I):
+                continue
+            link = FORM_LINK.search(m["body"] or "")
+            if link:
+                out.append({**r, "form_url": link.group(0).rstrip(".,;"), "form_note": (m["summary"] or "")[:300]})
+    return out
+
+
+def auto_assist(service, cfg: dict, report: dict) -> None:
+    """Without being asked: take the best offers that only need a human step (captcha, test) and leave each form filled
+    in its own tab of the visible browser, with a deadline, so the user just does that step and presses submit.
+    Fills as many as the hold limit allows in one cycle."""
+    pilot = cfg["autopilot"]
+    if not pilot.get("auto_assist", False):
+        return
+    healed = heal_holds()
+    if healed:
+        report["holds_rebuilt"] = healed
+    if not within(pilot["apply_hours"]):
+        return
+    room = int(pilot.get("max_holds", 12)) - len(active_holds())
+    if room <= 0:
+        return
+    with connect() as db:
+        rows = [dict(r) for r in db.execute(
+            """SELECT j.*, a.status AS app_status, a.channel, a.note FROM jobs j JOIN applications a ON a.job_id=j.id
+               WHERE j.status='action_needed' AND a.status='not_sent'
+               AND j.id NOT IN (SELECT job_id FROM events WHERE kind='assist' AND job_id IS NOT NULL)
+               ORDER BY j.score DESC, a.updated_at DESC""")]
+    jobs = [r for r in rows if attention_kind(r) == "finish"]
+    for q in recruiter_forms():
+        if q["id"] not in {j["id"] for j in jobs}:
+            jobs.append(q)
+    for job in jobs[:room]:
+        progress(f"Dejándote lista la postulación a {job['company']} para que la termines")
+        result = assist_form(job["id"], cfg, url=job.get("form_url", ""), instruction=job.get("form_note", ""))
+        with connect() as db:
+            log_event(db, job["id"], "assist", result["detail"][:500])
+        if not result["ready"]:
+            report["errors"].append(f"No pude dejar listo el formulario de {job['company']}: {result['detail'][:200]}")
+            continue
+        until = result["until"].astimezone(LOCAL_TZ)
+        report.setdefault("assisted", []).append(job["company"])
+        notify(service, cfg, f"Terminá la postulación a {job['company']} antes de las {until:%H:%M}",
+               f"{job['title']} en {job['company']}\n\nTe la dejé completa en el navegador del agente, en su propia pestaña. "
+               f"Falta lo que no puedo hacer yo: {job['note']}\n\n"
+               + (screen_links() + "\n" if screen_links() else "") +
+               f"Tenés hasta las {until:%H:%M}: hasta esa hora no cierro esa ventana y no postulo por formularios. "
+               "Cuando la envíes tocá «Ya me postulé» en el tablero o esperá el acuse: lo detecto solo.")
 
 
 SIGNUP_SCHEMA = {
@@ -474,9 +1145,7 @@ def prepare_signup_pages(job_ids: list[int], cfg: dict) -> list[dict]:
     import urllib.request
     jobs = [radar.job(i) for i in job_ids]
     close_agent_edge()
-    edge = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe"
-    subprocess.Popen([str(edge), f"--user-data-dir={EDGE_PROFILE}", f"--remote-debugging-port={ASSIST_PORT}",
-                      "--no-first-run", "about:blank"])
+    launch_agent_browser(f"--remote-debugging-port={ASSIST_PORT}", "about:blank")
     for _ in range(30):
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{ASSIST_PORT}/json/version", timeout=1)
@@ -496,7 +1165,8 @@ def prepare_signup_pages(job_ids: list[int], cfg: dict) -> list[dict]:
     try:
         result = llm.ask("Sos un asistente que navega páginas. Seguí las instrucciones al pie de la letra.", prompt,
                          SIGNUP_SCHEMA, model=cfg["autopilot"].get("model", "sonnet"), timeout=15 * 60,
-                         extra=["--mcp-config", str(config), "--strict-mcp-config", "--allowedTools", "mcp__playwright"])
+                         extra=["--mcp-config", str(config), "--strict-mcp-config", "--allowedTools", "mcp__playwright",
+                                "--disallowedTools", "mcp__playwright__browser_close"])
     except llm.LLMError as exc:
         return [{"company": "", "url": "", "google": False, "detail": str(exc)}]
     with connect() as db:
@@ -510,6 +1180,8 @@ def prepare_signup_pages(job_ids: list[int], cfg: dict) -> list[dict]:
 
 def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run: bool = False):
     """Apply through the posting's web form. With dry_run it fills everything, never submits, and returns the raw result."""
+    if not dry_run and browser_busy():
+        return "new"  # The agent's Edge holds a form the user is finishing: apply in a later cycle.
     upload = Path(cv["send_path"]) if cv.get("send_path") else upload_copy(cv)
     prompt = (
         f"Postulate a esta oferta en nombre de {cfg['candidate_name']} usando el navegador (herramientas de Playwright).\n\n"
@@ -519,6 +1191,9 @@ def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run:
            if job.get("user_input") else "")
         + f"Texto del CV (para años de experiencia, empresas, fechas):\n{cv_texts(cfg).get(cv['id'], '')}\n\n"
         f"Carta de presentación (usala si el formulario la pide; adaptá el largo si hace falta):\n{decision['body']}\n\n"
+        "Get on Board: si tiene 10 CV guardados y no deja subir otro, borrá el MÁS VIEJO de los que se llaman "
+        f"«{cv_upload_name(cfg)}» (los subió este agente) y subí el nuevo; nunca borres otros archivos ni cosas de la cuenta.\n"
+        "Cerrá solo la pestaña que abriste cuando termines de enviar con éxito; no toques las otras pestañas.\n\n"
         "Pasos:\n"
         "1. Abrí la URL y pulsá «Solicitar / Apply»; puede llevarte al sitio de la empresa (quizás en otra pestaña). "
         "Nunca te postules a través de LinkedIn: si el único camino es LinkedIn, devolvé blocked.\n"
@@ -535,8 +1210,9 @@ def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run:
         "- blocked: hay que crear una cuenta nueva, hay captcha, una prueba técnica o un paso que no podés completar.\n"
         "- needs_human: el formulario exige un dato que el perfil tiene como COMPLETAR o que no sabés; decí cuál en reason.\n"
         "- closed: el aviso ya no acepta postulaciones. already_applied: ya figura como postulado.\n"
-        "- not_fit: al leer el aviso completo resulta claramente incompatible.\n"
-        "En answers listá cada pregunta del formulario y lo que respondiste. No cierres el navegador vos.")
+        "- not_fit: al leer el aviso completo resulta claramente incompatible, o el aviso o el formulario exigen vivir "
+        "o estar en otro país o región que no incluye a Argentina (eso NO es needs_human: es not_fit).\n"
+        "En answers listá cada pregunta del formulario y lo que respondiste. No cierres el navegador vos." + FORM_FACTS + personal_form_rules())
     if dry_run:
         prompt += ("\n\nMODO ENSAYO: completá todo pero NO pulses el botón final de envío. Al llegar ahí devolvé "
                    "status=needs_human con reason='ensayo: listo para enviar' (o el estado real si te frenaste antes).")
@@ -544,7 +1220,7 @@ def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run:
             return llm.ask(system_prompt(cfg), prompt, FORM_SCHEMA, model=cfg["autopilot"].get("model", "sonnet"),
                            timeout=int(cfg["autopilot"].get("form_timeout_minutes", 15)) * 60,
                            extra=["--mcp-config", str(mcp_config(cfg)), "--strict-mcp-config",
-                                  "--allowedTools", "mcp__playwright"])
+                                  "--allowedTools", "mcp__playwright", "--disallowedTools", "mcp__playwright__browser_close"])
         finally:
             close_agent_edge()
     reserve(job, "", decision, cv, "form")
@@ -552,7 +1228,7 @@ def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run:
         result = llm.ask(system_prompt(cfg), prompt, FORM_SCHEMA, model=cfg["autopilot"].get("model", "sonnet"),
                          timeout=int(cfg["autopilot"].get("form_timeout_minutes", 15)) * 60,
                          extra=["--mcp-config", str(mcp_config(cfg)), "--strict-mcp-config",
-                                "--allowedTools", "mcp__playwright"])
+                                "--allowedTools", "mcp__playwright", "--disallowedTools", "mcp__playwright__browser_close"])
     except llm.LLMError as exc:
         with connect() as db:
             db.execute("UPDATE applications SET status='unknown', updated_at=? WHERE job_id=?", (now(), job["id"]))
@@ -592,13 +1268,38 @@ def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run:
     if status in ("closed", "not_fit"):
         radar.set_status(job["id"], "skipped", result["reason"])
         return "skipped"
+    if PROVIDER_REJECTED.search(result["reason"]):  # the company itself says no: nothing to do, no mail
+        radar.set_status(job["id"], "skipped", "La empresa no recibe más postulaciones: " + result["reason"])
+        return "skipped"
     # Anything else the agent can't do (new account, captcha, test...) is the user's call: never a silent dead end.
     if ACCOUNT_HINTS.search(result["reason"]):
         return needs_account(service, job, cfg, result["site"], result["reason"], result)
+    if LOCATION_REJECTED.search(result["reason"]):  # la oferta es para otro país: se descarta sin avisar
+        radar.set_status(job["id"], "skipped", "Pide vivir en otro país: " + result["reason"])
+        return "skipped"
     radar.set_status(job["id"], "action_needed", "No se pudo postular: " + result["reason"])
     notify(service, cfg, f"No pude postular a {job['company']}",
            f"{job['title']} en {job['company']}\n{job['url']}\n\n{result['reason']}")
     return "action_needed"
+
+
+PROVIDER_REJECTED = re.compile(r"limiting applications|limit(ing|ed)? (the number of )?applications|no longer accepting|"
+                               r"not accepting (any )?(new )?applications|too many applications|position (has been )?filled|"
+                               r"limita(ndo|mos)? (las )?postulaciones|no (acepta|recibe) m[aá]s postulaciones", re.I)
+LOCATION_REJECTED = re.compile(r"(reside|residir|residencia|ubicaci[oó]n|located in|based in|must (live|be located)|"
+                               r"only (candidates|applicants|accepting)|pa[ií]s (que|donde) busca|candidates must)"
+                               r".{0,120}(no (es|est[aá]|incluye|cumpl)|not (in|eligible|argentina)|otro pa[ií]s|"
+                               r"costa rica|m[eé]xico|colombia|chile|brasil|brazil|uruguay|per[uú]|espa[nñ]a|spain|"
+                               r"usa|united states|canad|europe)", re.I | re.S)
+CLOUDFLARE = re.compile(r"cloudflare|just a moment|additional verification|security verification|ray id", re.I)
+DEBUG_LOG = radar.ROOT / "data" / "debug.log"
+
+
+def debug_log(job, text: str) -> None:
+    """Lo que el usuario no puede resolver: queda acá para revisarlo, nunca en el mail."""
+    who = f"{job['id']} {job.get('company', '')}: " if job else ""
+    with DEBUG_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(f"{now()} {who}{text}" + "\n")
 
 
 ACCOUNT_HINTS = re.compile(r"cuenta|registr|sign ?up|sign ?in|login|iniciar sesi|crear .*usuario|account", re.I)
@@ -617,8 +1318,8 @@ def needs_account(service, job: dict, cfg: dict, site: str, reason: str, result:
                      f"CUENTA: {site or radar.urlparse(job['url']).netloc} pide crear cuenta o iniciar sesión. {reason}")
     notify(service, cfg, f"Creá la cuenta para postular a {job['company']}",
            f"{job['title']} en {job['company']}\n{job['url']}\n\n{reason}\n\n"
-           f"En WorkWorm → Pipeline → Tu atención: «Abrir en el Edge del agente», creá la cuenta con {cfg['candidate_email']} "
-           "(o entrá con Google), cerrá la ventana y tocá «Listo, reintentar».")
+           f"Ya te dejé la pestaña abierta en la pantalla del agente: creá la cuenta con {cfg['candidate_email']} "
+           "(o entrá con Google) y tocá «Listo, reintentar» en el tablero.")
     return "action_needed"
 
 
@@ -691,6 +1392,23 @@ def required_years(text: str) -> int:
     return found
 
 
+ONSITE_HINTS = re.compile(
+    r"on-?site|100% presencial|presencial|in-?office|office[- ]based|5 d[ií]as en (la )?oficina|"
+    r"5 days (a |per )?(week )?in (the )?office", re.I)
+REMOTE_HINTS = re.compile(r"100% remot|fully remote|full[- ]remote|totalmente remot|remote[- ]first|100% a distancia", re.I)
+
+
+def not_remote(job: dict) -> str:
+    """Reason when the offer is hybrid or on-site (the candidate only accepts fully remote work), or ''."""
+    mode = radar.modality(job)
+    if mode == "Presencial":
+        return "Excluida: modalidad presencial (solo remoto o híbrido)"
+    text = f"{job.get('title', '')}\n{job.get('location', '')}\n{job.get('description', '')}"
+    if ONSITE_HINTS.search(text) and not REMOTE_HINTS.search(text):
+        return "Excluida: el aviso parece presencial (solo remoto o híbrido)"
+    return ""
+
+
 def excluded(job: dict, cfg: dict) -> str:
     """Reason the offer matches a hard exclusion from config (title keyword, company, years, cloud), or ''."""
     rules = exclusions(cfg)
@@ -705,6 +1423,10 @@ def excluded(job: dict, cfg: dict) -> str:
     for name in rules["companies"]:
         if normalize(name) and normalize(name) in company:
             return f"Excluida por empresa: «{name}»"
+    if rules.get("remote_only") and not any(
+            normalize(n) and normalize(n) in company for n in rules.get("onsite_ok_companies", [])):
+        if reason := not_remote(job):
+            return reason
     limit = int(rules.get("max_years") or 0)
     if limit and job.get("description"):
         years = required_years(job["description"])
@@ -713,7 +1435,7 @@ def excluded(job: dict, cfg: dict) -> str:
     return cloud_block(job, cfg) if job.get("description") else ""
 
 
-def apply_exclusions(cfg: dict, statuses: tuple[str, ...] = ("new", "manual")) -> int:
+def apply_exclusions(cfg: dict, statuses: tuple[str, ...] = ("new", "manual", "action_needed")) -> int:
     """Move offers matching a hard exclusion to 'skipped'. Links the user added are never excluded."""
     moved = 0
     with connect() as db:
@@ -759,7 +1481,7 @@ def remember_in_profile(cfg: dict, text: str, context: str) -> None:
 
 
 MANUAL_FINISH_HINTS = re.compile(r"captcha|recaptcha|hcaptcha|no soy un robot|i.?m not a robot|verificaci[oó]n humana|"
-                                 r"prueba t[eé]cnica|assessment|test t[eé]cnico", re.I)
+                                 r"prueba t[eé]cnica|assessment|test t[eé]cnico|video", re.I)
 
 
 def attention_kind(job: dict) -> str:
@@ -877,6 +1599,7 @@ def mark_applied_manually(job_id: int) -> None:
                    (job_id, "", "", "", "sent", "manual", now(), now(), now()))
         db.execute("UPDATE jobs SET status='applied', updated_at=? WHERE id=?", (now(), job_id))
         log_event(db, job_id, "applied", "Te postulaste vos")
+    clear_hold(job_id)
 
 
 def check_every_seconds(cfg: dict) -> int:
@@ -899,7 +1622,9 @@ def auto_apply(service, cfg: dict, report: dict) -> None:
         budget = pilot["max_applications_per_day"] - applications_today(db)
         rows = [dict(r) for r in db.execute(
             """SELECT * FROM jobs WHERE status='new' AND description != ''
-               ORDER BY source='link' DESC, COALESCE(NULLIF(posted_at, ''), seen_at) DESC""")]
+               AND (source='link' OR score >= ?)
+               ORDER BY source='link' DESC, score DESC, COALESCE(NULLIF(posted_at, ''), seen_at) DESC""",
+            (int(pilot.get("min_score", 0)),))]
     if budget <= 0:
         report["daily_cap_reached"] = True
         return
@@ -918,6 +1643,9 @@ def auto_apply(service, cfg: dict, report: dict) -> None:
             last_mail_check = time.time()
         domain = radar.urlparse(row["url"]).netloc.replace("www.", "")
         if not row["contact_email"] and domain in no_login:
+            continue
+        if not row["contact_email"] and browser_busy():
+            report["on_hold"] = report.get("on_hold", 0) + 1  # the Edge is busy with a form the user is finishing
             continue
         progress(f"Postulando: {row['title']} · {row['company'] or 'empresa sin dato'}",
                  queue_done=done, queue_total=len(rows))
@@ -957,24 +1685,112 @@ def known_threads(db, job_id: int, app_thread: str) -> set[str]:
     return {t for t in threads | {app_thread} if t}
 
 
+def best_by_title(candidates: list[dict], text: str) -> dict | None:
+    """Several applications to the same company (Mercado Libre has many): pick the one whose title the mail
+    mentions; if none is named, the most recently sent one."""
+    if not candidates:
+        return None
+    body = radar.title_key(text)
+    named = [a for a in candidates if radar.title_key(a.get("title", "")) and radar.title_key(a["title"]) in body]
+    if named:
+        return max(named, key=lambda a: len(radar.title_key(a["title"])))
+    return max(candidates, key=lambda a: a.get("sent_at") or a.get("updated_at") or "")
+
+
 def match_job(sender: str, text: str, apps: list[dict]) -> dict | None:
     address = parseaddr(sender)[1].lower()
     domain = address.split("@")[-1]
     if any(x in address for x in ("jobalert", "alert", "newsletter", "digest", "jobs-listings", "marketing")):
         return None
+    exact = [app for app in apps if address == app.get("recipient")]
+    if exact:
+        return best_by_title(exact, text)
+    same_domain = [app for app in apps if domain not in FREE_DOMAINS and domain == (app.get("recipient") or "").split("@")[-1]]
+    if same_domain:
+        return best_by_title(same_domain, text)
+    body = normalize(sender + "\n" + text)
+    squashed = re.sub(r"[^a-z0-9]", "", body)
+    named = []
     for app in apps:
-        if address == app["recipient"]:
-            return app
-    for app in apps:
-        app_domain = app["recipient"].split("@")[-1]
-        if domain == app_domain and domain not in FREE_DOMAINS:
-            return app
-    body = normalize(text)
-    for app in apps:
-        name = normalize(app["company"])
-        if len(name) >= 4 and re.search(rf"\b{re.escape(name)}\b", body):
-            return app
-    return None
+        key = radar.company_key(app["company"])
+        if (any(len(n) >= 4 and re.search(rf"\b{re.escape(n)}\b", body) for n in {normalize(app["company"]), key})
+                or len(key.replace(" ", "")) >= 6 and key.replace(" ", "") in squashed):  # «Mutt Data» = «Muttdata»
+            named.append(app)
+    return best_by_title(named, text)
+
+
+def via_portal(sender: str, text: str, apps: list[dict]) -> dict | None:
+    """Portal acks (ZonaJobs, Computrabajo...) come from the portal, not the company: match the portal's domain
+    against the offer's or its login page's, and the title the mail names."""
+    domain = parseaddr(sender)[1].lower().split("@")[-1]
+    root = ".".join(domain.split(".")[-3:] if domain.endswith((".com.ar", ".com.br")) else domain.split(".")[-2:])
+    body = radar.title_key(text)
+    hits = [a for a in apps
+            if any(root and root in radar.urlparse(u or "").netloc for u in (a.get("url"), a.get("login_url")))
+            and radar.title_key(a["title"]) in body]
+    return best_by_title(hits, text)
+
+
+ACK_HINTS = re.compile(r"thank(s| you) for (applying|your (application|interest))|we (have )?received your application|"
+                       r"application (received|submitted)|recibimos tu postulaci|recibieron tu postulaci|"
+                       r"registramos tu aplicaci|gracias por (postularte|tu postulaci|aplicar)|"
+                       r"tu postulaci[oó]n (fue|ha sido) (recibida|enviada)", re.I)
+
+
+def detect_manual_applications(service, cfg: dict, report: dict) -> int:
+    """Offers the agent left for the user (captcha, account, video...) that the user then applied to by hand:
+    when the company's «we received your application» mail arrives, mark them applied, so they leave
+    «Requiere tu atención» without anyone pressing «Ya me postulé»."""
+    with connect() as db:
+        waiting = [dict(r) for r in db.execute(
+            """SELECT j.*, a.recipient, a.thread_id, a.sent_at, a.cv_file, a.login_url, a.updated_at AS app_updated
+               FROM jobs j JOIN applications a ON a.job_id=j.id
+               WHERE j.status IN ('action_needed', 'failed') AND a.status IN ('not_sent', 'unknown')""")]
+    if not waiting:
+        return 0
+    since = min(radar.parse_time(a["app_updated"]) for a in waiting) - timedelta(days=1)
+    # Only mails that look like an acknowledgement: fetching every mail in full burns the Gmail per-minute quota.
+    query = (f"-from:me -in:sent -in:spam -in:trash after:{int(since.timestamp())} "
+             '{"thank you for applying" "thanks for applying" "received your application" "application received" '
+             '"recibimos tu postulación" "recibieron tu postulación" "registramos tu aplicación" '
+             '"gracias por postularte" "gracias por tu postulación" "thank you for your interest"}')
+    listing = gmail_exec(service.users().messages().list(userId="me", q=query, maxResults=50))
+    with connect() as db:
+        known = {r["gmail_id"] for r in db.execute("SELECT gmail_id FROM messages")}
+    found = 0
+    fetched = 0
+    for item in listing.get("messages", []):
+        if item["id"] in known or not waiting:
+            continue
+        if fetched >= GMAIL_BATCH:
+            break  # next cycle continues: nothing was marked seen
+        fetched += 1
+        message = gmail_exec(service.users().messages().get(userId="me", id=item["id"], format="full"))
+        sender, subject = header(message, "From"), header(message, "Subject")
+        text = subject + "\n" + plain_text(message["payload"])[:4000]
+        if not ACK_HINTS.search(text):
+            continue
+        app = match_job(sender, text, waiting) or via_portal(sender, text, waiting)
+        # Stricter than tracking: the mail must name this offer's title. A company ack for ANOTHER role
+        # (Accenture «Changemakers Program» vs. the Node.js offer) must not mark this one as applied.
+        if not app or radar.title_key(app["title"]) not in radar.title_key(text):
+            continue
+        at = datetime.fromtimestamp(int(message["internalDate"]) / 1000, timezone.utc).isoformat(timespec="seconds")
+        mark_applied_manually(app["id"])
+        with connect() as db:
+            db.execute("""INSERT OR IGNORE INTO messages(gmail_id,job_id,thread_id,direction,sender,subject,body,kind,summary,at)
+                          VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                       (message["id"], app["id"], message["threadId"], "in", sender, subject, text[:6000], "auto_ack",
+                        "Acuse de la empresa: te postulaste vos", at))
+            db.execute("UPDATE applications SET thread_id=?, last_inbound_at=? WHERE job_id=?",
+                       (message["threadId"], at, app["id"]))
+            db.execute("CREATE TABLE IF NOT EXISTS seen_mail (gmail_id TEXT PRIMARY KEY)")
+            db.execute("DELETE FROM seen_mail WHERE gmail_id=?", (message["id"],))
+            log_event(db, app["id"], "applied", f"Llegó el acuse de {parseaddr(sender)[1]}: lo marqué como postulado")
+        waiting = [w for w in waiting if w["id"] != app["id"]]
+        found += 1
+    report["manual_detected"] = found
+    return found
 
 
 def handle_inbound(service, cfg: dict, app: dict, message: dict, report: dict) -> None:
@@ -1075,23 +1891,30 @@ def track(service, cfg: dict, report: dict) -> None:
             for t in known_threads(db, app["id"], app["thread_id"]):
                 thread_owner[t] = app
     for thread_id, app in thread_owner.items():
-        data = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+        data = gmail_exec(service.users().threads().get(userId="me", id=thread_id, format="full"))
         for message in data.get("messages", []):
             if message["id"] not in seen:
                 pending.append((app, message))
                 seen.add(message["id"])
     # Recruiters often answer from a new thread or another address.
-    oldest = min(radar.parse_time(a["sent_at"]) for a in apps)
+    times = [t for t in (radar.parse_time(a["sent_at"]) for a in apps) if t]  # some rows have no sent_at
+    if not times:
+        return
+    oldest = min(times)
     # All mail, not just the inbox: mail_organizer archives job mail out of the inbox.
     query = f"-from:me -in:sent -in:spam -in:trash -in:drafts after:{int(oldest.timestamp())}"
-    listing = service.users().messages().list(userId="me", q=query, maxResults=200).execute()
+    listing = gmail_exec(service.users().messages().list(userId="me", q=query, maxResults=200))
     with connect() as db:
         db.execute("CREATE TABLE IF NOT EXISTS seen_mail (gmail_id TEXT PRIMARY KEY)")
         ignored = {r["gmail_id"] for r in db.execute("SELECT gmail_id FROM seen_mail")}
+    fetched = 0
     for item in listing.get("messages", []):
         if item["id"] in seen or item["id"] in ignored or item["threadId"] in thread_owner:
             continue
-        message = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
+        if fetched >= GMAIL_BATCH:
+            break  # next cycle continues: nothing was marked seen
+        fetched += 1
+        message = gmail_exec(service.users().messages().get(userId="me", id=item["id"], format="full"))
         app = match_job(header(message, "From"), header(message, "Subject") + "\n" + plain_text(message["payload"]), apps)
         if app:
             pending.append((app, message))
@@ -1245,6 +2068,16 @@ def start_cycle(force_collect: bool = True) -> None:
                      | getattr(subprocess, "DETACHED_PROCESS", 0), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _video_scripts(service, cfg: dict, report: dict) -> None:
+    import video
+    video.prepare(service, cfg, report)
+
+
+def _top_drafts(service, cfg: dict, report: dict) -> None:
+    import top
+    top.prepare(service, cfg, report)
+
+
 def run(force_collect: bool = False) -> dict:
     """One autopilot cycle. Safe to call often: a lock prevents overlapping runs."""
     LOCK.parent.mkdir(exist_ok=True)
@@ -1264,25 +2097,41 @@ def run(force_collect: bool = False) -> dict:
             report["errors"].append(f"Falta el archivo del CV: {path} (¿lo renombraste? actualizá config.json → cvs)")
         report["excluded"] = apply_exclusions(cfg)
         report["manual"] = triage_manual(cfg)
-        service = radar.gmail_service()
+        try:
+            service = radar.gmail_service()
+        except radar.GmailExpired as exc:
+            report["errors"].append(str(exc))
+            return report
         if not service:
             report["errors"].append("Gmail no está conectado")
             return report
         # With the autopilot off nothing is sent: no applications, replies or follow-ups.
         import linkedin_bot
         steps = ([("seguimiento de correos", track),
+                  ("verificar mails", verify_emails),
+                  ("postulaciones hechas a mano", detect_manual_applications),
                   ("linkedin", lambda service, cfg, report: linkedin_bot.resolve(cfg, report, progress)),
-                  ("postulaciones", auto_apply), ("recordatorios", followups)]
+                  ("postulaciones", auto_apply), ("empresas top", _top_drafts), ("guiones de video", _video_scripts),
+                  ("recordatorios", followups),
+                  ("terminar a mano", auto_assist)]
                  if cfg["autopilot"].get("enabled") else [])
         labels = {"seguimiento de correos": "Revisando tus correos y respondiendo a reclutadores",
+                  "verificar mails": "Verificando mails de cuentas nuevas",
+                  "postulaciones hechas a mano": "Buscando acuses de las postulaciones que terminaste vos",
                   "linkedin": "LinkedIn: buscando los botones «Solicitar» externos",
-                  "postulaciones": "Postulando", "recordatorios": "Enviando seguimientos"}
+                  "guiones de video": "Escribiendo guiones para los videos que piden", "postulaciones": "Postulando", "empresas top": "Empresas top: borradores investigados",
+                  "recordatorios": "Enviando seguimientos",
+                  "terminar a mano": "Dejándote lista una postulación que necesita un paso tuyo"}
         for name, step in steps:
             progress(labels[name])
             try:
                 step(service, cfg, report)
             except Exception as exc:
                 report["errors"].append(f"{name}: {exc}")
+        try:
+            send_digest(service, cfg, report)
+        except Exception as exc:
+            report["errors"].append(f"resumen por mail: {exc}")
         # Last: tidy the main inbox (after tracking read everything).
         if radar.gmail_can_modify("main"):
             import mail_organizer

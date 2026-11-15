@@ -178,7 +178,9 @@
     "notify_email": "tu.correo@gmail.com",
     "form_timeout_minutes": 25,
     "browser_headless": false,
-    "check_every_hours": 4
+    "check_every_hours": 4,
+    "auto_assist": false,
+    "hold_minutes": 180
   },
   "collect_every_hours": 4,
   "enrich_per_run": 60,
@@ -225,6 +227,11 @@
   "bumeran": {
     "enabled": true
   },
+  "startupsargentina": {
+    "enabled": true,
+    "max_pages": 25,
+    "details_per_run": 30
+  },
   "remote_boards": {
     "enabled": true
   },
@@ -236,7 +243,8 @@
     "max_added_skills": 2,
     "missing_in_cover_letter": true,
     "rules": "Adaptá el CV al aviso usando sus mismas palabras cuando describan algo que realmente hice. Reordená viñetas y habilidades para que lo más relevante quede primero. Nunca inventes logros, cifras, empresas, fechas ni responsabilidades.",
-    "cover_letter_rules": "Carta breve (4 a 7 oraciones), concreta y sin frases infladas. Mencioná 2 o 3 coincidencias reales entre el aviso y mi experiencia. Las tecnologías que pide el aviso y no están en mi experiencia nombralas como tecnologías que manejo o con las que estoy trabajando, nunca como experiencia laboral ni con años de uso. No te disculpes ni señales carencias: no menciones requisitos que no cumplo (seniority, industria, años), salvo nombrar las tecnologías faltantes así."
+    "cover_letter_rules": "Carta breve (4 a 7 oraciones), concreta y sin frases infladas. Mencioná 2 o 3 coincidencias reales entre el aviso y mi experiencia. Las tecnologías que pide el aviso y no están en mi experiencia nombralas como tecnologías que manejo o con las que estoy trabajando, nunca como experiencia laboral ni con años de uso. No te disculpes ni señales carencias: no menciones requisitos que no cumplo (seniority, industria, años), salvo nombrar las tecnologías faltantes así.",
+    "experience_hint": ""
   },
   "language": {
     "mode": "auto",
@@ -331,5 +339,19 @@
     "label": "Ofertas de trabajo",
     "archive": true,
     "days": 60
+  },
+  "personal": {
+    "_comentario": "Datos propios: links de tu pantalla, reglas tuyas para formularios, cuenta para proyectos. No se publican.",
+    "screen_url": "",
+    "dashboard_url": "",
+    "form_rules": "",
+    "cv_upload_name": "",
+    "extra_env_file": "",
+    "projects": {
+      "github_owner": "",
+      "git_name": "",
+      "git_email": "",
+      "forbidden_accounts": ""
+    }
   }
 }

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import copy
 import re
 import unicodedata
@@ -121,9 +123,14 @@ def ask_claude(job: dict, facts: dict, cfg: dict, language: str, as_email: bool)
     prompt = (
         "Adaptá mi CV a esta oferta y escribí la carta de presentación.\n\n"
         "REGLAS DURAS (se verifican automáticamente y lo que las viole se descarta):\n"
-        "1. Resumen y viñetas de experiencia: solo hechos que ya están en el CV. Podés reescribirlos, reordenarlos y usar "
-        "el vocabulario del aviso, pero NO agregues tecnologías, herramientas ni tareas que no figuren en esa misma viñeta "
-        "o en el CV. Mantené la cantidad de roles y no agregues viñetas.\n"
+        + ("1. Resumen y viñetas de experiencia: tengo experiencia en todo lo que pide el aviso. Reescribí las viñetas "
+           "con el vocabulario del aviso y sumá las tecnologías y tareas que pide, atribuidas al rol real donde sean "
+           "creíbles" + (f" ({s['experience_hint']})" if s.get("experience_hint") else "") + ". Orientá todo al puesto: nada de "
+           "listar todo lo que hice, solo lo que le sirve a esta oferta. No inventes cifras, empresas ni fechas. "
+           "Mantené la cantidad de roles y no agregues viñetas.\n" if s.get("allow_job_technologies") else
+           "1. Resumen y viñetas de experiencia: solo hechos que ya están en el CV. Podés reescribirlos, reordenarlos y usar "
+           "el vocabulario del aviso, pero NO agregues tecnologías, herramientas ni tareas que no figuren en esa misma viñeta "
+           "o en el CV. Mantené la cantidad de roles y no agregues viñetas.\n")
         + ("2. Habilidades técnicas: podés agregar las tecnologías que pide el aviso y no tengo (máximo "
            f"{s['max_added_skills']}), ubicándolas en la categoría que corresponda o en una línea nueva "
            "«Otras tecnologías» / «Other technologies». Conservá todas las categorías y valores existentes, reordenados "
@@ -144,13 +151,15 @@ def ask_claude(job: dict, facts: dict, cfg: dict, language: str, as_email: bool)
 
 # ---------- enforcing the rules ----------
 
-def guard(facts: dict, proposal: dict, cfg: dict) -> tuple[dict, list[str], list[str]]:
+def guard(facts: dict, proposal: dict, cfg: dict, job: dict | None = None) -> tuple[dict, list[str], list[str]]:
     """Revert any experience/summary text that introduces technologies absent from the CV.
     Returns (clean proposal, added skills, reverted notes)."""
     s = settings(cfg)
     original_text = facts["summary"] + " " + " ".join(f"{x['label']} {x['value']}" for x in facts["skills"]) + " " + \
         " ".join(b for r in facts["roles"] for b in r["bullets"])
     known = set(radar.technologies(original_text))
+    if s.get("allow_job_technologies") and job:  # config: el candidato declara experiencia en lo que pide el aviso
+        known |= set(radar.technologies(f"{job.get('title', '')} {job.get('description', '')}"))
     reverted = []
 
     summary = proposal["summary"].strip() if s["tailor_summary"] else facts["summary"]
@@ -249,7 +258,18 @@ def write_docx(source: Path, content: dict, target: Path) -> None:
 
 
 def to_pdf(docx_path: Path, pdf_path: Path) -> None:
-    """Convert with a private, invisible Word instance (does not touch documents the user has open)."""
+    """Convert with a private, invisible Word instance (does not touch documents the user has open).
+    On Linux, with LibreOffice headless."""
+    if os.name != "nt":
+        import shutil
+        import subprocess
+        import tempfile
+        soffice = shutil.which("soffice") or str(Path.home() / "libreoffice/opt/program/soffice")
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run([soffice, "--headless", f"-env:UserInstallation=file://{tmp}/profile", "--convert-to", "pdf",
+                            "--outdir", tmp, str(docx_path)], check=True, capture_output=True, timeout=180)
+            shutil.move(str(Path(tmp) / (Path(docx_path).stem + ".pdf")), str(pdf_path))
+        return
     import pythoncom
     import win32com.client
     pythoncom.CoInitialize()
@@ -275,7 +295,7 @@ def build(job: dict, cv: dict, cfg: dict, language: str, as_email: bool, folder:
     source = Path(cv["docx"])
     facts = base_facts(parse(docx.Document(str(source))))
     proposal = ask_claude(job, facts, cfg, language, as_email)
-    content, added, reverted = guard(facts, proposal, cfg)
+    content, added, reverted = guard(facts, proposal, cfg, job)
     target_dir = OUT / (folder or str(job["id"]))
     stem = ascii_name(Path(cv["path"]).stem)
     docx_out, pdf_out = target_dir / f"{stem}.docx", target_dir / f"{stem}.pdf"

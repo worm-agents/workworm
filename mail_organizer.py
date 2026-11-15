@@ -20,6 +20,10 @@ JOB_SUBJECT = re.compile(r"postulaci|candidatur|your application|tu aplicaci|tu 
                          r"we appreciate you applying|thank you for applying|gracias por postularte", re.I)
 
 
+LOGIN_SUBJECT = re.compile(r"sign in|log ?in|iniciar sesi|inicia sesi|magic link|verif|confirm|c[oó]digo|code|"
+                           r"one[- ]time|password|contrase", re.I)
+
+
 def settings(cfg: dict) -> dict:
     return {**DEFAULTS, **cfg.get("mail_organizer", {})}
 
@@ -34,6 +38,8 @@ def label_id(service, name: str) -> str:
 
 
 def is_job_mail(sender: str, subject: str, thread_id: str, known_threads: set[str], known_ids: set[str], msg_id: str) -> bool:
+    if LOGIN_SUBJECT.search(subject or ""):
+        return False  # sign-in links and codes stay in the inbox: the user needs them right now
     if msg_id in known_ids or thread_id in known_threads:
         return True
     address = parseaddr(sender)[1].lower()

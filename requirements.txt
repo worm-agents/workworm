@@ -10,3 +10,5 @@ pymupdf>=1.24,<2
 playwright>=1.48,<2
 pywin32>=306; sys_platform == "win32"
 tzdata>=2024.1
+faster-whisper>=1.1,<2
+av==16.0.1  # faster-whisper 1.2.1 breaks with newer av (metadata_errors)

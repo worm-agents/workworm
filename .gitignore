@@ -11,3 +11,13 @@ config.json
 profile.md
 .streamlit/secrets.toml
 *.log
+
+# Archivos propios del usuario (no son parte de WorkWorm)
+CV/
+*_jero.*
+dolar_profile.py
+form.md
+edit.yml
+*.patch
+/*.png
+*.bak*
