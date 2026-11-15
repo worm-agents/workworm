@@ -188,6 +188,7 @@ class AgentTests(unittest.TestCase):
                         patch.object(agent, "PROGRESS", root / "progress.json"),
                         patch.object(radar, "gmail_service", return_value=None),  # never touch real Gmail in tests
                         patch.object(agent, "LOCK", root / "agent.lock"),
+                        patch.object(agent, "HOLD", root / "edge_hold.json"),
                         patch.object(agent, "cv_texts", return_value={"es": "CV text"})]
         for p in self.patches:
             p.start()
@@ -213,9 +214,11 @@ class AgentTests(unittest.TestCase):
                 "subject": "Data Engineer – Ana Pérez", "body": "Hola"}
 
     def test_auto_apply_sends_cv_once_and_respects_daily_cap(self):
-        first = self.add("1", "Python SQL ETL. Enviar CV a cv@acme.com")
-        self.add("2", "Python SQL ETL. Enviar CV a jobs@other.com")
-        self.add("3", "Python SQL ETL. Postulate en el formulario")
+        # Same seen_at for all three, so a clock tick between inserts can't put another offer first.
+        with patch.object(radar, "now", return_value="2026-10-01T12:00:00+00:00"):
+            first = self.add("1", "Python SQL ETL. Enviar CV a cv@acme.com")
+            self.add("2", "Python SQL ETL. Enviar CV a jobs@other.com")
+            self.add("3", "Python SQL ETL. Postulate en el formulario")
         report = {"applied": 0, "skipped": 0, "errors": []}
         with patch.object(agent.llm, "ask", return_value=self.decision()):
             agent.auto_apply(self.service, self.cfg, report)
@@ -517,6 +520,186 @@ class AgentTests(unittest.TestCase):
         self.assertIsNone(agent.match_job("Bob <bob@gmail.com>", "hola", apps))
         self.assertIs(agent.match_job("rrhh@talent.io", "Proceso en Globant", apps), apps[1])
         self.assertIsNone(agent.match_job("jobalerts-noreply@linkedin.com", "Globant", apps))
+
+
+class GmailExpiryTests(unittest.TestCase):
+    def test_revoked_token_raises_gmail_expired_and_cycle_reports_it(self):
+        from google.auth.exceptions import RefreshError
+        with tempfile.TemporaryDirectory() as temp:
+            secrets = Path(temp)
+            (secrets / "credentials.json").write_text("{}", encoding="utf-8")
+            (secrets / "token_main.json").write_text("{}", encoding="utf-8")
+            creds = MagicMock(expired=True, refresh_token="r")
+            creds.refresh.side_effect = RefreshError("invalid_grant: Token has been expired or revoked.")
+            with patch.object(radar, "SECRETS", secrets), \
+                 patch.object(radar, "gmail_account", return_value="me@example.org"), \
+                 patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=creds):
+                with self.assertRaises(radar.GmailExpired) as caught:
+                    radar.gmail_service()
+                self.assertIn("me@example.org", str(caught.exception))
+                with patch.object(agent, "LOCK", secrets / "agent.lock"), \
+                     patch.object(agent, "PROGRESS", secrets / "progress.json"), \
+                     patch.object(radar, "config", return_value={"autopilot": {}}), \
+                     patch.object(agent, "collect_due", return_value=False), \
+                     patch.object(agent, "missing_cvs", return_value=[]), \
+                     patch.object(agent, "apply_exclusions", return_value=0), \
+                     patch.object(agent, "triage_manual", return_value=0), \
+                     patch.object(agent, "progress"), patch.object(agent, "queue_size", return_value=0):
+                    report = agent.run()
+        self.assertTrue(any("Venció la autorización de Gmail" in e for e in report["errors"]))
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class StartupsArgentinaTests(unittest.TestCase):
+    def fixture(self, name: str) -> str:
+        return (FIXTURES / name).read_text(encoding="utf-8")
+
+    def test_list_page_cards_and_page_count(self):
+        jobs, pages = radar.parse_startupsargentina_list(self.fixture("startupsargentina_list.html"))
+        self.assertEqual(pages, 18)
+        self.assertEqual(len(jobs), 3)
+        first = jobs[0]
+        self.assertEqual(first["external_id"], "51a67401-4d9e-4549-9d4d-534b7d2b77df")
+        self.assertEqual(first["title"], "Junior Software Engineer")
+        self.assertEqual(first["company"], "Canals")
+        self.assertEqual(first["location"], "Colombia / Argentina / Brazil")
+        self.assertEqual(first["remote"], "remote")
+        self.assertEqual(first["url"], "https://www.startupsargentina.com/empleos/canals/"
+                                       "51a67401-4d9e-4549-9d4d-534b7d2b77df/junior-software-engineer")
+        self.assertEqual(jobs[1]["remote"], "onsite")
+        self.assertEqual(jobs[2]["location"], "Argentina (Remote); Buenos Aires, Buenos Aires, Argentina")
+        self.assertTrue(radar.eligible_location(jobs[2]))
+
+    def test_detail_page_description_date_and_apply_link(self):
+        detail = radar.parse_startupsargentina_detail(self.fixture("startupsargentina_detail.html"))
+        self.assertIn("Python, TypeScript and React", detail["description"])
+        self.assertIn("Tipo: FullTime", detail["description"])
+        self.assertNotIn("Aplicar", detail["description"])
+        self.assertTrue(detail["posted_at"].startswith("2026-10-22"))
+        self.assertEqual(detail["apply_url"], "https://jobs.ashbyhq.com/canals/f5be2674-0d4b-406d-bc29-be5e657b8ac5/application")
+        empty = radar.parse_startupsargentina_detail(self.fixture("startupsargentina_detail_empty.html"))
+        self.assertNotIn("todavía no publicó", empty["description"])
+        self.assertEqual(empty["apply_url"], "https://careers-meli.mercadolibre.com/es/positions?id=45017013")
+
+    def test_fetch_reads_details_only_for_target_roles(self):
+        pages = {"list": self.fixture("startupsargentina_list.html"),
+                 "detail": self.fixture("startupsargentina_detail.html")}
+        session = MagicMock()
+
+        def get(url, params=None, timeout=None):
+            response = MagicMock()
+            response.text = pages["list"] if url.endswith("/empleos") else pages["detail"]
+            return response
+        session.get.side_effect = get
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(radar, "DB_PATH", Path(temp) / "radar.sqlite3"), \
+             patch.object(radar, "browser_session", return_value=session), \
+             patch.object(radar, "target_role", side_effect=lambda job: "engineer" in job["title"].lower()), \
+             patch("time.sleep"):
+            jobs = radar.fetch_startupsargentina({"startupsargentina": {"enabled": True, "max_pages": 2}})
+        list_calls = [c for c in session.get.call_args_list if c.args[0].endswith("/empleos")]
+        self.assertEqual(len(list_calls), 2)  # capped by max_pages, not the 18 pages of the site
+        self.assertEqual(len(jobs), 3)  # same cards on both pages are not repeated
+        canals = jobs[0]
+        self.assertEqual(canals["url"], "https://jobs.ashbyhq.com/canals/f5be2674-0d4b-406d-bc29-be5e657b8ac5/application")
+        self.assertIn("PostgreSQL", canals["description"])
+        self.assertEqual(jobs[2]["description"], "")  # not a searched role: no detail request
+        self.assertEqual(session.get.call_count, 3)
+
+    def test_fetch_reuses_offers_whose_detail_was_already_read(self):
+        session = MagicMock()
+        session.get.return_value.text = self.fixture("startupsargentina_list.html")
+        with tempfile.TemporaryDirectory() as temp,              patch.object(radar, "DB_PATH", Path(temp) / "radar.sqlite3"),              patch.object(radar, "browser_session", return_value=session),              patch.object(radar, "target_role", return_value=True),              patch("time.sleep"):
+            with radar.connect() as db:
+                radar.upsert(db, {"source": "startupsargentina", "external_id": "51a67401-4d9e-4549-9d4d-534b7d2b77df",
+                                  "title": "Junior Software Engineer", "company": "Canals",
+                                  "url": "https://jobs.ashbyhq.com/canals/x/application", "description": "Python"})
+            jobs = radar.fetch_startupsargentina({"startupsargentina": {"max_pages": 1, "details_per_run": 1}})
+        self.assertEqual(jobs[0]["url"], "https://jobs.ashbyhq.com/canals/x/application")
+        self.assertEqual(jobs[0]["description"], "Python")
+        self.assertEqual(session.get.call_count, 2)  # list page + the one detail allowed (second card), none for Canals
+
+
+class SameOfferAndManualApplyTests(unittest.TestCase):
+    setUp, tearDown, decision = AgentTests.setUp, AgentTests.tearDown, AgentTests.decision
+
+    def job(self, external_id, title, company, source="indeed"):
+        with radar.connect() as db:
+            radar.upsert(db, {"source": source, "external_id": external_id, "title": title, "company": company,
+                              "location": "Argentina", "url": "https://example.org/" + external_id,
+                              "description": "Python SQL"})
+            return db.execute("SELECT id FROM jobs WHERE source=? AND external_id=?",
+                              (source, external_id)).fetchone()["id"]
+
+    def test_company_key_joins_portal_spellings(self):
+        self.assertEqual(radar.company_key("Mercado Livre"), radar.company_key("Mercado Libre"))
+        self.assertEqual(radar.company_key("Acme S.A."), radar.company_key("ACME"))
+        self.assertNotEqual(radar.company_key("Acme"), radar.company_key("Acmex"))
+
+    def test_same_posting_on_two_portals_is_applied_once(self):
+        first = self.job("1", "Data & Analytics Engineer", "Mercado Livre")
+        second = self.job("2", "Data & Analytics Engineer", "Mercado Libre", source="startupsargentina")
+        agent.mark_applied_manually(first)
+        with patch.object(agent.llm, "ask") as ask:
+            status = agent.apply(self.service, radar.job(second), self.cfg)
+        self.assertEqual(status, "skipped")
+        ask.assert_not_called()  # decided before spending tokens
+        self.assertEqual(radar.job(second)["status"], "skipped")
+        self.assertTrue(any("mismo aviso" in e["detail"] for e in radar.events()))
+
+    def test_ack_goes_to_the_offer_it_names(self):
+        apps = [{"id": 1, "title": "Software Engineer - Traffic & Platform Security", "company": "Mercado Libre",
+                 "recipient": "", "sent_at": "2026-11-04T10:00:00+00:00"},
+                {"id": 2, "title": "Data & Analytics Engineer", "company": "Mercado Libre", "recipient": "",
+                 "sent_at": "2026-11-03T10:00:00+00:00"}]
+        text = "Registramos tu aplicación para Mercado Libre. Puesto: Data & Analytics Engineer"
+        self.assertEqual(agent.match_job("MELI People <noreplypeople@mercadolibre.com>", text, apps)["id"], 2)
+
+    def test_ack_for_offer_left_to_the_user_marks_it_applied(self):
+        job_id = self.job("7", "Data Engineer", "Mutt Data")
+        with radar.connect() as db:
+            db.execute("""INSERT INTO applications(job_id,recipient,subject,body,status,channel,updated_at)
+                          VALUES(?,?,?,?,?,?,?)""", (job_id, "", "", "", "not_sent", "form", "2026-11-05T10:00:00+00:00"))
+        radar.set_status(job_id, "action_needed", "No se pudo postular: hCaptcha")
+        body = base64.urlsafe_b64encode("Hey Jerónimo, thank you for applying to Data Engineer at Mutt Data".encode()).decode()
+        message = {"id": "g1", "threadId": "th1", "internalDate": "1793990000000",
+                   "payload": {"mimeType": "text/plain", "body": {"data": body},
+                               "headers": [{"name": "From", "value": "Muttdata <no-reply@hire.lever.co>"},
+                                           {"name": "Subject", "value": "Thank you for applying to Data Engineer"}]}}
+        self.msgs.list.return_value.execute.return_value = {"messages": [{"id": "g1", "threadId": "th1"}]}
+        self.msgs.get.return_value.execute.return_value = message
+        report = {"errors": []}
+        self.assertEqual(agent.detect_manual_applications(self.service, self.cfg, report), 1)
+        record = radar.job(job_id)
+        self.assertEqual((record["status"], record["channel"]), ("applied", "manual"))
+
+    def test_portal_ack_and_ack_for_another_role(self):
+        apps = [{"id": 1, "title": "Analista de Datos", "company": "Obra Social Union Personal",
+                 "url": "https://www.bumeran.com.ar/empleos/1.html",
+                 "login_url": "https://www.zonajobs.com.ar/login?returnTo=/empleos/1"},
+                {"id": 2, "title": "Fullstack developer Specialist", "company": "Accenture", "url": "https://x.org/2"}]
+        portal = agent.via_portal("Zonajobs <no_reply@zonajobs.com.ar>", "Te postulaste a Analista de Datos", apps)
+        self.assertEqual(portal["id"], 1)
+        other = agent.match_job("Accenture <accenture@myworkday.com>",
+                                "Thanks for applying for the role of Changemakers Program at Accenture", apps)
+        self.assertEqual(other["id"], 2)  # company matches...
+        self.assertNotIn(radar.title_key(other["title"]), radar.title_key("Changemakers Program"))  # ...title doesn't
+
+    def test_form_left_for_the_user_survives_cycles_until_it_expires(self):
+        agent.set_hold(5, 60)
+        with patch("subprocess.run") as kill:
+            agent.close_agent_edge()
+            kill.assert_not_called()
+            agent.close_agent_edge(force=True)
+            kill.assert_called_once()
+        self.assertEqual(agent.apply_form(self.service, {"id": 9}, self.cfg, self.decision(""), {}), "new")
+        agent.mark_applied_manually(self.job("8", "Data Engineer", "Acme"))
+        self.assertIsNotNone(agent.hold_info())  # another offer: the hold stays
+        agent.clear_hold(5)
+        self.assertIsNone(agent.hold_info())
+
 
 if __name__ == "__main__":
     unittest.main()

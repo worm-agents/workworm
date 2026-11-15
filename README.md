@@ -78,6 +78,8 @@ WorkWorm usa dos conexiones (`config.json → gmail_accounts`):
 
 Pueden ser la misma cuenta. Se piden permisos de lectura, redacción y (en `main`) etiquetas. Durante la búsqueda no se envían correos.
 
+Mientras la app de Google Cloud esté en modo **Testing**, Google invalida la autorización cada 7 días. Cuando pasa, el tablero muestra «Venció la autorización de Gmail» y el agente no lee ni manda correos hasta que la renueves en **Configuración → Gmail**. Para que no venza, en la pantalla de consentimiento OAuth pulsá **Publish app** (pasa a «In production»). No hace falta que Google la verifique para usarla vos: al autorizar vas a ver el aviso «Google no verificó esta app», elegí **Configuración avanzada → Ir a…**.
+
 ## Configuración
 
 | Sección de `config.json` | Para qué sirve |
@@ -87,7 +89,7 @@ Pueden ser la misma cuenta. Se piden permisos de lectura, redacción y (en `main
 | `search_terms` | Búsquedas que se lanzan en cada fuente. |
 | `scoring` | Cargos buscados (`role_terms`), títulos principales, palabras de seniority, peso de cada skill y tecnologías que se muestran. |
 | `home` | Tu país, ciudades, región, zona horaria y ubicaciones que no te sirven. Define la elegibilidad de las ofertas. |
-| `indeed`, `getonbrd`, `computrabajo`, `bumeran`, `remote_boards`, `boards` | Fuentes y empresas de Greenhouse/Lever. Computrabajo y Bumeran son de Argentina. |
+| `indeed`, `getonbrd`, `computrabajo`, `bumeran`, `startupsargentina`, `remote_boards`, `boards` | Fuentes y empresas de Greenhouse/Lever. Computrabajo, Bumeran y Startups Argentina son de Argentina. |
 | `exclusions`, `cloud_filter` | Qué ofertas descartar. El filtro de nube (por ejemplo, solo Azure) está apagado por defecto. |
 | `tailoring`, `language` | Reglas para adaptar CV y carta, e idioma. |
 | `autopilot` | Horarios, límite diario, seguimientos y correo de avisos. |

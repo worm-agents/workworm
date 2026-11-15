@@ -277,7 +277,25 @@ def control_panel():
 
 control_panel()
 
-attention = [j for j in all_jobs if j["status"] == "action_needed"]
+
+@st.cache_data(ttl=300, show_spinner=False)
+def gmail_expired() -> list[str]:
+    """Messages for the Gmail connections whose token Google revoked (checked at most every 5 min)."""
+    expired = []
+    for role in radar.GMAIL_TOKENS:
+        try:
+            radar.gmail_service(role=role)
+        except radar.GmailExpired as exc:
+            expired.append(str(exc))
+        except Exception:
+            pass
+    return expired
+
+
+for notice in dict.fromkeys(gmail_expired()):
+    st.error(f"[!!] {notice}")
+
+attention =[j for j in all_jobs if j["status"] == "action_needed"]
 manual_jobs = [j for j in all_jobs if j["status"] == "manual"]
 if attention:
     st.warning(f"[!!] {len(attention)} te necesitan: " + ", ".join(j['company'] or j['title'] for j in attention)
@@ -819,11 +837,12 @@ with sources_tab:
                "lever": any(b["provider"] == "lever" for b in cfg["boards"]),
                "computrabajo": cfg.get("computrabajo", {}).get("enabled", False),
                "bumeran": cfg.get("bumeran", {}).get("enabled", False),
+               "startupsargentina": cfg.get("startupsargentina", {}).get("enabled", False),
                **{k: cfg.get("remote_boards", {}).get("enabled", False) for k in ("himalayas", "remotive", "jobicy")},
                "link": True, "linkedin_ext": cfg.get("linkedin_external", {}).get("enabled", True)}
     prefixes = {"linkedin_alert": "LinkedIn", "indeed": "Indeed", "getonbrd": "Get on Board",
                 "greenhouse": "greenhouse", "lever": "lever", "computrabajo": "Computrabajo", "bumeran": "Bumeran",
-                "himalayas": "Remotos", "remotive": "Remotos", "jobicy": "Remotos", "link": "Link", "linkedin_ext": "LinkedIn externo"}
+                "startupsargentina": "Startups Argentina", "himalayas": "Remotos", "remotive": "Remotos", "jobicy": "Remotos", "link": "Link", "linkedin_ext": "LinkedIn externo"}
     rows = []
     for key, (name, how, apply_how) in radar.SOURCES.items():
         problems = [e for e in errors if e.startswith(prefixes[key])]
@@ -889,10 +908,12 @@ with settings_general:
                              followup_after_days=int(followup), apply_hours=list(ah), reply_hours=list(rh),
                              check_every_hours=int(check_hours), browser_headless=headless)
                 save_config(cfg)
+                import os
                 import subprocess
-                subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                                str(radar.ROOT / "install_task.ps1")], capture_output=True,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if os.name == "nt":  # on Linux the cycle is a systemd timer
+                    subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                    str(radar.ROOT / "install_task.ps1")], capture_output=True,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 next_run_text.clear()
                 st.success("Guardado")
                 st.rerun()
@@ -902,17 +923,21 @@ with settings_general:
         for role, label in (("main", "Principal: postulaciones y reclutadores"),
                             ("alerts", "Notificaciones: alertas de LinkedIn y avisos del radar")):
             address = radar.gmail_account(role)
+            state = "sin conectar"
             try:
                 connected = radar.gmail_service(role=role) is not None
+            except radar.GmailExpired:
+                connected, state = False, "la autorización venció"
             except Exception:
                 connected = False
             if connected:
                 st.success(f"{label} · {address} · conectado")
             else:
-                st.warning(f"{label} · {address} · sin conectar (o el token venció)")
+                st.warning(f"{label} · {address} · {state}")
                 if st.button(f"Autorizar {address}", key=f"auth-{role}"):
                     try:
                         radar.gmail_service(interactive=True, role=role)
+                        gmail_expired.clear()
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))

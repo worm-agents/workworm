@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
 from email.message import EmailMessage
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -60,6 +60,8 @@ STATUSES = {
     "new": "Nueva",
     "blocked": "No se pudo postular",
     "manual": "Lista para que postules vos",
+    "top": "Empresa top · preparando el borrador",
+    "top_ready": "Empresa top · borrador listo para que postules vos",
     "skipped": "Descartada por el agente",
     "discarded": "Descartada por vos",
     "applied": "CV enviado · esperando respuesta",
@@ -81,6 +83,7 @@ SOURCES = {
     "getonbrd": ("Get on Board", "API pública de búsqueda", "Formulario de Get on Board (requiere sesión iniciada en el Edge del agente)"),
     "greenhouse": ("Greenhouse", "API pública de cada empresa configurada", "Formulario de Greenhouse, con el navegador del agente"),
     "lever": ("Lever", "API pública de cada empresa configurada", "Formulario de Lever, con el navegador del agente"),
+    "ashby": ("Ashby", "API pública de cada empresa configurada", "Formulario de Ashby, con el navegador del agente"),
     "link": ("Links que agregás vos", "Pegados en el tablero (p. ej. el link externo de un aviso de LinkedIn)",
              "Formulario de la empresa o del tercerizado, con el navegador del agente"),
     "linkedin_ext": ("LinkedIn → sitio externo", "Botón «Solicitar» de avisos de LinkedIn (máx. 5 cada 4 h, 1 min entre avisos)",
@@ -89,6 +92,8 @@ SOURCES = {
                      "Postulación en Computrabajo (sesión iniciada en el Edge del agente)"),
     "bumeran": ("Bumeran / ZonaJobs", "API de búsqueda del sitio (ZonaJobs publica los mismos avisos)",
                 "Postulación en Bumeran (sesión iniciada en el Edge del agente)"),
+    "startupsargentina": ("Startups Argentina", "Listado de startupsargentina.com/empleos + página de cada aviso que interesa",
+                          "Formulario de la empresa (su ATS), con el navegador del agente"),
     "himalayas": ("Himalayas", "API pública de empleos remotos", "Formulario de la empresa, con el navegador del agente"),
     "remotive": ("Remotive", "API pública de empleos remotos", "Formulario de la empresa, con el navegador del agente"),
     "jobicy": ("Jobicy", "API pública de empleos remotos", "Formulario de la empresa, con el navegador del agente"),
@@ -337,7 +342,7 @@ def clean_html(html: str) -> str:
 
 
 def eligible_location(job: dict) -> bool:
-    if job.get("source") in ("indeed", "computrabajo", "bumeran", "linkedin_alert"):
+    if job.get("source") in ("indeed", "computrabajo", "bumeran", "startupsargentina", "linkedin_alert"):
         # Local sites, or LinkedIn alerts whose location the user chose (e.g. USA/Norway/Netherlands remote).
         return True
     location = normalize(job.get("location", ""))
@@ -348,9 +353,112 @@ def eligible_location(job: dict) -> bool:
                                                                  "anywhere")) or location == ""
     if at_home(location) or any(x in location for x in (*h["region_terms"], "worldwide", "anywhere")):
         return True
+    if job.get("source") in ("greenhouse", "lever", "ashby"):
+        # Company boards (big US/EU companies): city lists or "Remote - US" mean not for someone in Argentina.
+        # Accept only home, region, global or a bare "Remote" with no country attached.
+        parts = [p.strip(" -,()") for p in re.split(r"[|;/]", location)]
+        return any(p in ("remote", "global", "remote global", "remote, global", "americas", "remote americas",
+                         "remote - americas", "fully remote") for p in parts) or "global" in location
     if any(x in location for x in h["blocked_locations"]):
         return False
     return "remote" in location or "remoto" in location or normalize(job.get("remote", "")) == "remote"
+
+
+
+# ---------- direct employer links (Indeed and Himalayas block the server's browser with Cloudflare) ----------
+
+BLOCKED_AGGREGATORS = ("himalayas.app", "indeed.com")
+
+
+def blocked_aggregator(url: str) -> bool:
+    host = urlparse(url or "").netloc.lower()
+    return any(host == d or host.endswith("." + d) for d in BLOCKED_AGGREGATORS)
+
+
+def _ascii(text: str) -> str:
+    import unicodedata
+    return unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode().lower()
+
+
+def _title_key(title: str) -> str:
+    t = re.sub(r"^\s*#?\s*\d+\s*[-–.:]?\s*", "", _ascii(title))  # "#6 Data Scientist" -> "data scientist"
+    return " ".join(re.findall(r"[a-z0-9]+", t))
+
+
+def _title_match(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+    a, b = _title_key(a), _title_key(b)
+    if not a or not b:
+        return 0.0
+    if a == b or a in b or b in a:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _company_slugs(company: str, url: str = "") -> list[str]:
+    base = re.sub(r"(inc|llc|ltd|sa|srl|sas|corp|gmbh|bv|limited)\.?", "", _ascii(company))
+    words = re.findall(r"[a-z0-9]+", base)
+    out = ["".join(words), "-".join(words)]
+    m = re.search(r"himalayas\.app/companies/([^/]+)/", url or "")
+    if m:
+        out += [m.group(1), m.group(1).replace("-", "")]
+    return [x for x in dict.fromkeys(out) if x]
+
+
+def employer_url(job: dict, session=None) -> str:
+    """Find the same posting on the employer's own ATS (Lever, Greenhouse, Ashby, Workable, Recruitee,
+    SmartRecruiters) through their public APIs, so the browser never has to open Indeed or Himalayas."""
+    session = session or requests.Session()
+    title = job.get("title", "")
+    jk = re.search(r"jk=([0-9a-f]+)", job.get("url") or "")
+    if jk:  # Indeed: search the same posting again with JobSpy, which returns the employer's link
+        try:
+            from jobspy import scrape_jobs
+            cfg = config()
+            frame = scrape_jobs(site_name=["indeed"], search_term=f"{title} {job.get('company', '')}",
+                                location=cfg["indeed"]["location"], country_indeed=cfg["indeed"]["country"],
+                                results_wanted=10, verbose=0)
+            for x in frame.to_dict("records"):
+                direct = str(x.get("job_url_direct") or "")
+                if jk.group(1) in str(x.get("job_url")) and direct.startswith("http") and not blocked_aggregator(direct):
+                    return direct
+        except Exception:
+            pass
+    best, best_score = "", 0.0
+    for slug in _company_slugs(job.get("company", ""), job.get("url", "")):
+        apis = [
+            (f"https://api.lever.co/v0/postings/{slug}?mode=json", lambda d: [(x.get("text"), x.get("hostedUrl")) for x in d]),
+            (f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs", lambda d: [(x.get("title"), x.get("absolute_url")) for x in d.get("jobs", [])]),
+            (f"https://api.ashbyhq.com/posting-api/job-board/{slug}", lambda d: [(x.get("title"), x.get("jobUrl") or x.get("applyUrl")) for x in d.get("jobs", [])]),
+            (f"https://apply.workable.com/api/v1/widget/accounts/{slug}", lambda d: [(x.get("title"), x.get("url") or x.get("application_url")) for x in d.get("jobs", [])]),
+            (f"https://{slug}.recruitee.com/api/offers/", lambda d: [(x.get("title"), x.get("careers_apply_url") or x.get("careers_url")) for x in d.get("offers", [])]),
+            (f"https://api.smartrecruiters.com/v1/companies/{slug}/postings", lambda d: [(x.get("name"), f"https://jobs.smartrecruiters.com/{slug}/{x.get('id')}") for x in d.get("content", [])]),
+        ]
+        for api, pick in apis:
+            try:
+                r = session.get(api, timeout=15)
+                if r.status_code != 200:
+                    continue
+                for t, u in pick(r.json()):
+                    score = _title_match(title, t or "")
+                    if u and score > best_score:
+                        best, best_score = u, score
+            except Exception:
+                continue
+        if best_score >= 0.85:
+            break
+    return best if best_score >= 0.85 else ""
+
+
+def set_url(job_id: int, url: str) -> None:
+    with connect() as db:
+        db.execute("UPDATE jobs SET url=?, updated_at=? WHERE id=?", (url, now(), job_id))
+        log_event(db, job_id, "url", f"Link directo de la empresa: {url}")
+
+
+def personal(key: str, default=""):
+    """Datos propios del usuario (links de su pantalla, reglas, cuentas): config.json → personal, que no se publica."""
+    return config().get("personal", {}).get(key, default)
 
 
 def fetch_board(board: dict, session: requests.Session) -> list[dict]:
@@ -375,6 +483,18 @@ def fetch_board(board: dict, session: requests.Session) -> list[dict]:
                  "remote": x.get("workplaceType", ""), "url": x["hostedUrl"],
                  "description": x.get("descriptionPlain") or clean_html(x.get("description", "")),
                  "posted_at": ""} for x in entries]
+    if provider == "ashby":
+        url = f"https://api.ashbyhq.com/posting-api/job-board/{token}"
+        response = session.get(url, timeout=25)
+        response.raise_for_status()
+        entries = response.json()["jobs"]
+        return [{"source": "ashby", "external_id": f"{token}:{x['id']}",
+                 "title": x["title"], "company": board["name"],
+                 "location": " | ".join(filter(None, [x.get("location", "")] +
+                                               [s.get("location", "") for s in x.get("secondaryLocations") or []])),
+                 "remote": "remote" if x.get("isRemote") else "", "url": x.get("jobUrl") or x.get("applyUrl", ""),
+                 "description": x.get("descriptionPlain") or clean_html(x.get("descriptionHtml", "")),
+                 "posted_at": x.get("publishedAt", "")} for x in entries if x.get("isListed", True)]
     raise ValueError(f"Proveedor desconocido: {provider}")
 
 
@@ -470,6 +590,104 @@ def fetch_bumeran(cfg: dict) -> list[dict]:
     return found
 
 
+STARTUPS_AR = "https://www.startupsargentina.com"
+SPANISH_MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
+                  "octubre", "noviembre", "diciembre")
+
+
+def parse_startupsargentina_list(html: str) -> tuple[list[dict], int]:
+    """Cards of one /empleos page plus the total page count ("Página 1 de 18")."""
+    soup = BeautifulSoup(html, "html.parser")
+    found = []
+    for card in soup.select("article"):
+        link = card.select_one('h2 a[href^="/empleos/"]')
+        if not link:
+            continue
+        parts = link["href"].strip("/").split("/")  # empleos/<startup>/<uuid>/<slug>
+        if len(parts) < 3:
+            continue
+        company = card.select_one('p a[href^="/startups/"]')
+        place = card.find("span", recursive=False)
+        where, _, mode = (place.get_text(" ", strip=True) if place else "").partition(" · ")
+        found.append({"source": "startupsargentina", "external_id": parts[2], "title": link.get_text(" ", strip=True),
+                      "company": company.get_text(" ", strip=True) if company else parts[1],
+                      "location": where.strip(), "remote": "remote" if normalize(mode) == "remote" else mode.strip(),
+                      "url": STARTUPS_AR + link["href"], "description": "", "posted_at": ""})
+    pages = re.search(r"P\w+gina\s+\d+\s+de\s+(\d+)", soup.get_text(" ", strip=True))
+    return found, int(pages.group(1)) if pages else 1
+
+
+def parse_startupsargentina_detail(html: str) -> dict:
+    """Description, facts, publication date and the employer's apply link (usually its ATS) of one offer."""
+    soup = BeautifulSoup(html, "html.parser")
+    facts = {normalize(dt.get_text(" ", strip=True)): dd.get_text(" ", strip=True)
+             for dt, dd in zip(soup.select("dl.job-detail-facts dt"), soup.select("dl.job-detail-facts dd"))}
+    apply = soup.select_one("a.job-detail-apply__button[href]")
+    apply_href = apply["href"] if apply else ""  # read before the header (which holds the button) is dropped
+    copy_node = soup.select_one("article.job-detail-copy")
+    description = ""
+    if copy_node and not copy_node.select_one(".job-detail-empty"):
+        for header in copy_node.select(".job-detail-copy__header"):
+            header.decompose()
+        description = copy_node.get_text("\n", strip=True)
+    posted = ""
+    date = re.match(r"(\d{1,2}) de (\w+) de (\d{4})", normalize(facts.get("publicada", "")))
+    if date and date.group(2) in SPANISH_MONTHS:
+        posted = datetime(int(date.group(3)), SPANISH_MONTHS.index(date.group(2)) + 1, int(date.group(1)),
+                          tzinfo=BUMERAN_TZ).isoformat()
+    apply_url = ""
+    if apply_href:
+        parts = urlparse(apply_href)
+        query = urlencode([(k, v) for k, v in parse_qsl(parts.query) if not k.startswith("utm_")])
+        apply_url = parts._replace(query=query).geturl()
+    extra = " · ".join(f"{k.capitalize()}: {v}" for k, v in facts.items() if k in ("tipo", "modalidad"))
+    return {"description": (description + ("\n\n" + extra if extra else "")).strip(), "posted_at": posted,
+            "apply_url": apply_url}
+
+
+def fetch_startupsargentina(cfg: dict) -> list[dict]:
+    """Startups Argentina (startupsargentina.com/empleos): server-rendered list pages plus each matching offer's page."""
+    import time
+    conf = cfg.get("startupsargentina", {})
+    session, found, seen = browser_session(), [], set()
+    page, pages = 1, 1
+    while page <= min(pages, int(conf.get("max_pages", 25))):
+        response = session.get(f"{STARTUPS_AR}/empleos", params={"page": page} if page > 1 else None, timeout=25)
+        response.raise_for_status()
+        cards, pages = parse_startupsargentina_list(response.text)
+        if not cards:
+            break
+        for job in cards:
+            if job["external_id"] not in seen:
+                seen.add(job["external_id"])
+                found.append(job)
+        page += 1
+        time.sleep(1)
+    with connect() as db:
+        known = {r["external_id"]: dict(r) for r in db.execute(
+            "SELECT external_id, url, description, posted_at FROM jobs WHERE source='startupsargentina'")}
+        # Offers already stored from another platform are dropped by collect(); don't spend detail requests on them.
+        repeated = {job["external_id"] for job in found if job["external_id"] not in known and duplicate(db, job)}
+    limit, fetched = int(conf.get("details_per_run", 30)), 0
+    for job in found:
+        row = known.get(job["external_id"])
+        if row and not row["url"].startswith(STARTUPS_AR):
+            # Detail already read: keep it. Offers stored with the site's own URL got no detail yet (per-run cap).
+            job.update(url=row["url"], description=row["description"], posted_at=row["posted_at"])
+            continue
+        if fetched >= limit or job["external_id"] in repeated or not target_role(job):
+            continue
+        response = session.get(job["url"], timeout=25)
+        response.raise_for_status()
+        detail = parse_startupsargentina_detail(response.text)
+        job.update(description=detail["description"], posted_at=detail["posted_at"])
+        if detail["apply_url"]:
+            job["url"] = detail["apply_url"]  # apply straight on the employer's form
+        fetched += 1
+        time.sleep(1)
+    return found
+
+
 def fetch_remote_boards(cfg: dict) -> list[dict]:
     """Remote job boards with public APIs: Himalayas, Remotive and Jobicy. Location filtering happens in collect()."""
     session, found, errors = browser_session(), [], []
@@ -507,18 +725,46 @@ def fetch_remote_boards(cfg: dict) -> list[dict]:
     return found
 
 
+LEGAL_SUFFIXES = re.compile(r"\b(s\.?a\.?s?|s\.?r\.?l|s\.?a\.?u|spa|inc|llc|ltd|ltda|corp|gmbh|co)\b\.?", re.I)
+COMPANY_ALIASES = {"mercado livre": "mercado libre", "meli": "mercado libre"}
+
+
+def company_key(name: str) -> str:
+    """One key per company across portals: 'Mercado Livre' (Indeed) and 'Mercado Libre' (Startups Argentina),
+    'Acme S.A.' and 'ACME', are the same employer."""
+    key = LEGAL_SUFFIXES.sub(" ", normalize(name))
+    key = re.sub(r"[^a-z0-9 ]+", " ", key)
+    key = re.sub(r"\s+", " ", key).strip()
+    return COMPANY_ALIASES.get(key, key)
+
+
+def title_key(title: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", normalize(title))).strip()
+
+
 def duplicate(db: sqlite3.Connection, job: dict) -> bool:
     """Same title and company already stored (another platform, or the same one under another ID)."""
-    company = normalize(job.get("company", ""))
+    company = company_key(job.get("company", ""))
     if len(company) < 3 or "confidencial" in company:
         return False
-    title = normalize(job["title"])
-    for row in db.execute("""SELECT title FROM jobs WHERE lower(company)=lower(?)
-                             AND NOT (source=? AND external_id=?)""",
-                          (job.get("company", ""), job["source"], str(job["external_id"]))):
-        if normalize(row["title"]) == title:
+    title = title_key(job["title"])
+    for row in db.execute("SELECT title, company FROM jobs WHERE NOT (source=? AND external_id=?)",
+                          (job["source"], str(job["external_id"]))):
+        if company_key(row["company"]) == company and title_key(row["title"]) == title:
             return True
     return False
+
+
+def already_applied_elsewhere(db: sqlite3.Connection, job: dict) -> dict | None:
+    """Another stored offer with the same company and title was already applied to (or is being applied to)."""
+    company, title = company_key(job.get("company", "")), title_key(job["title"])
+    if len(company) < 3 or "confidencial" in company:
+        return None
+    for row in db.execute("""SELECT j.id, j.title, j.company, j.source FROM jobs j JOIN applications a ON a.job_id=j.id
+                             WHERE j.id != ? AND a.status IN ('sent', 'sending', 'unknown')""", (job["id"],)):
+        if company_key(row["company"]) == company and title_key(row["title"]) == title:
+            return dict(row)
+    return None
 
 
 def linkedin_description(job_id: str, session: requests.Session) -> str:
@@ -572,7 +818,8 @@ def fetch_indeed(cfg: dict) -> list[dict]:
                             country_indeed=cfg["indeed"]["country"],
                             results_wanted=cfg["indeed"]["results_per_query"], verbose=0)
         for x in frame.to_dict("records"):
-            url = cell(x.get("job_url"))
+            # The employer's own page when Indeed has it: the server's browser gets a Cloudflare wall on Indeed.
+            url = cell(x.get("job_url_direct")) or cell(x.get("job_url"))
             if not url or url == "nan":
                 continue
             found.append({"source": "indeed", "external_id": cell(x.get("id")) or url,
@@ -626,8 +873,14 @@ def gmail_account(role: str) -> str:
     return accounts.get(role) or cfg["candidate_email"]
 
 
+class GmailExpired(RuntimeError):
+    """Google revoked the stored token (in Testing mode it lasts 7 days); the user must authorize again."""
+
+
 def gmail_service(interactive: bool = False, role: str = "main"):
-    """Return an authorized Gmail API service for a role, or None until OAuth is configured for it."""
+    """Return an authorized Gmail API service for a role, or None until OAuth is configured for it.
+    Raises GmailExpired when the stored token can no longer be refreshed."""
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -643,6 +896,11 @@ def gmail_service(interactive: bool = False, role: str = "main"):
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
+        except RefreshError:
+            if not interactive:
+                raise GmailExpired(f"Venció la autorización de Gmail de {gmail_account(role)}. "
+                                   "Volvé a autorizarla en Configuración → Gmail.") from None
+            creds = None
         except Exception:
             creds = None
     if not creds or not creds.valid:
@@ -703,7 +961,12 @@ def collect() -> dict:
     session.headers["User-Agent"] = USER_AGENT
     for board in cfg.get("boards", []):
         try:
-            jobs.extend(fetch_board(board, session))
+            fetched = fetch_board(board, session)
+            if board.get("top"):
+                # Dream companies: never auto-applied; top.py prepares a researched draft for the user.
+                for job in fetched:
+                    job["top"] = True
+            jobs.extend(fetched)
         except Exception as exc:
             errors.append(f"{board['provider']}:{board['token']}: {exc}")
     if cfg.get("indeed", {}).get("enabled"):
@@ -717,6 +980,7 @@ def collect() -> dict:
         except Exception as exc:
             errors.append(f"Get on Board: {exc}")
     for key, name, fetch in (("computrabajo", "Computrabajo", fetch_computrabajo), ("bumeran", "Bumeran", fetch_bumeran),
+                             ("startupsargentina", "Startups Argentina", fetch_startupsargentina),
                              ("remote_boards", "Remotos", fetch_remote_boards)):
         if cfg.get(key, {}).get("enabled"):
             try:
@@ -744,6 +1008,9 @@ def collect() -> dict:
                     continue
                 if upsert(db, job):
                     added += 1
+                    if job.get("top"):
+                        db.execute("UPDATE jobs SET status='top' WHERE source=? AND external_id=? AND status='new'",
+                                   (job["source"], str(job["external_id"])))
                 else:
                     updated += 1
             except Exception as exc:
