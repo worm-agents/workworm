@@ -622,6 +622,9 @@ def apply(service, job: dict, cfg: dict, recipient_hint: str = "", force: bool =
     Returns 'applied', 'skipped', 'blocked', 'action_needed', 'failed', 'new' or 'login_required:<site>'."""
     if is_manual(job):
         return "manual"  # LinkedIn: never applied automatically.
+    easy = is_easy_auto(job, cfg)
+    if easy and linkedin_easy_today() >= int(linkedin_easy(cfg)["max_per_day"]):
+        return "new"  # LinkedIn Easy Apply daily cap: stays queued for tomorrow
     if radar.blocked_aggregator(job.get("url", "")) and not job.get("contact_email"):
         # Indeed and Himalayas show Cloudflare to the server's browser: go straight to the employer's form.
         direct = radar.employer_url(job)
@@ -1197,7 +1200,8 @@ def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run:
         "Cerrá solo la pestaña que abriste cuando termines de enviar con éxito; no toques las otras pestañas.\n\n"
         "Pasos:\n"
         "1. Abrí la URL y pulsá «Solicitar / Apply»; puede llevarte al sitio de la empresa (quizás en otra pestaña). "
-        "Nunca te postules a través de LinkedIn: si el único camino es LinkedIn, devolvé blocked.\n"
+        + (LINKEDIN_EASY_STEP if is_easy_auto(job, cfg) else
+           "Nunca te postules a través de LinkedIn: si el único camino es LinkedIn, devolvé blocked.\n") +
         "2. Completá todos los campos con los datos del perfil y del CV. Subí el CV con la herramienta de carga de archivos. "
         "Preguntas de selección o de años de experiencia: respondé con la verdad según el CV. Pretensión salarial, "
         "disponibilidad y modalidad: según el perfil.\n"
@@ -1211,8 +1215,10 @@ def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run:
         "- blocked: hay que crear una cuenta nueva, hay captcha, una prueba técnica o un paso que no podés completar.\n"
         "- needs_human: el formulario exige un dato que el perfil tiene como COMPLETAR o que no sabés; decí cuál en reason.\n"
         "- closed: el aviso ya no acepta postulaciones. already_applied: ya figura como postulado.\n"
-        "- not_fit: al leer el aviso completo resulta claramente incompatible, o el aviso o el formulario exigen vivir "
-        "o estar en otro país o región que no incluye a Argentina (eso NO es needs_human: es not_fit).\n"
+        "- not_fit: al leer el aviso completo resulta claramente incompatible, o el aviso o el formulario exigen vivir, "
+        "tener residencia o permiso de trabajo en otro país o región que no incluye a Argentina, o mudarse (eso NO es "
+        "needs_human: es not_fit). Una empresa de otro país que contrata en remoto NO es not_fit, y un híbrido o "
+        "presencial en CABA/GBA tampoco.\n"
         "En answers listá cada pregunta del formulario y lo que respondiste. No cierres el navegador vos." + FORM_FACTS + personal_form_rules())
     if dry_run:
         prompt += ("\n\nMODO ENSAYO: completá todo pero NO pulses el botón final de envío. Al llegar ahí devolvé "
@@ -1225,6 +1231,9 @@ def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run:
         finally:
             close_agent_edge()
     reserve(job, "", decision, cv, "form")
+    if is_easy_auto(job, cfg):
+        with connect() as db:  # counted when tried, not when sent: the cap protects the LinkedIn account
+            log_event(db, job["id"], "linkedin_easy_apply", job["url"])
     try:
         result = llm.ask(system_prompt(cfg), prompt, FORM_SCHEMA, model=cfg["autopilot"].get("model", "sonnet"),
                          timeout=int(cfg["autopilot"].get("form_timeout_minutes", 15)) * 60,
@@ -1284,10 +1293,17 @@ def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run:
     return "action_needed"
 
 
+LINKEDIN_EASY_STEP = (
+    "Esta oferta es «Solicitud sencilla» de LinkedIn y el candidato autorizó postular ahí con su sesión: pulsá "
+    "«Solicitud sencilla / Easy Apply», completá cada paso del modal (CV: elegí o subí el indicado), sin seguir a "
+    "ninguna empresa ni cambiar nada del perfil, y enviá UNA vez. Si LinkedIn pide iniciar sesión, verificación, "
+    "captcha o muestra un límite de solicitudes, frená y devolvé login_required o blocked con el motivo.\n")
+
+
 PROVIDER_REJECTED = re.compile(r"limiting applications|limit(ing|ed)? (the number of )?applications|no longer accepting|"
                                r"not accepting (any )?(new )?applications|too many applications|position (has been )?filled|"
                                r"limita(ndo|mos)? (las )?postulaciones|no (acepta|recibe) m[aá]s postulaciones", re.I)
-LOCATION_REJECTED = re.compile(r"(reside|residir|residencia|ubicaci[oó]n|located in|based in|must (live|be located)|"
+LOCATION_REJECTED = re.compile(r"(reside|residir|residencia|must (live|be located|be based|reside)|"
                                r"only (candidates|applicants|accepting)|pa[ií]s (que|donde) busca|candidates must)"
                                r".{0,120}(no (es|est[aá]|incluye|cumpl)|not (in|eligible|argentina)|otro pa[ií]s|"
                                r"costa rica|m[eé]xico|colombia|chile|brasil|brazil|uruguay|per[uú]|espa[nñ]a|spain|"
@@ -1400,14 +1416,69 @@ REMOTE_HINTS = re.compile(r"100% remot|fully remote|full[- ]remote|totalmente re
 
 
 def not_remote(job: dict) -> str:
-    """Reason when the offer is hybrid or on-site (the candidate only accepts fully remote work), or ''."""
+    """Reason when the offer is on-site (used only with exclusions.remote_only), or ''.
+    «Híbrido, 2 días presencial» is hybrid, not on-site."""
     mode = radar.modality(job)
     if mode == "Presencial":
         return "Excluida: modalidad presencial (solo remoto o híbrido)"
     text = f"{job.get('title', '')}\n{job.get('location', '')}\n{job.get('description', '')}"
-    if ONSITE_HINTS.search(text) and not REMOTE_HINTS.search(text):
+    if ONSITE_HINTS.search(text) and not REMOTE_HINTS.search(text) and not HYBRID_HINTS.search(text):
         return "Excluida: el aviso parece presencial (solo remoto o híbrido)"
     return ""
+
+
+HYBRID_HINTS = re.compile(r"h[ií]brid|hybrid", re.I)
+
+
+def _places_in(location: str, places: list[str]) -> bool:
+    loc = _words(location)
+    return any(_words(p).strip() and _words(p) in loc for p in places)
+
+
+def location_block(job: dict, rules: dict) -> str:
+    """Where the candidate can work (2026-11-16): remote from anywhere (companies abroad preferred), hybrid or
+    on-site only in CABA/GBA (exclusions.local_places). Remote restricted to residents of another country
+    («Remote - US») is out. Returns the reason, or '' when the offer may go on (the LLM checks the rest)."""
+    location = job.get("location") or ""
+    loc = normalize(location)
+    local = rules.get("local_places") or []
+    h = radar.home()
+    open_terms = (*h["region_terms"], "worldwide", "anywhere", "global", "americas", normalize(h["country"]))
+    # «Remote - US», «US Remote», «Remoto (Reino Unido)»: remote only for residents of that country.
+    regions = [normalize(r) for r in rules.get("residency_regions", [])]
+    if regions and not any(t in loc for t in open_terms):
+        for part in re.split(r"[|;/]", loc):
+            words = _words(part)
+            if (" remote " in words or " remoto " in words) and any(_words(r) in words for r in regions if r.strip()):
+                return f"Excluida: remoto solo para residentes de otro país ({location})"
+    mode = radar.modality(job)
+    if mode == "Remoto":
+        return ""
+    text = f"{job.get('title', '')}\n{location}\n{job.get('description', '')}"
+    if mode == "Sin especificar":
+        if REMOTE_HINTS.search(text) or not (ONSITE_HINTS.search(text) or HYBRID_HINTS.search(text)):
+            return ""  # nothing says it is in an office: the LLM reads the full posting
+        mode = "Híbrido" if HYBRID_HINTS.search(text) else "Presencial"
+    if not loc.strip() or loc.strip(" ,.") in ("argentina", "ar") or _places_in(location, local):
+        return ""
+    return f"Excluida: {mode.lower()} fuera de CABA/GBA ({location})"
+
+
+def work_permit_block(job: dict, rules: dict) -> str:
+    """The posting legally requires living in / being authorized to work in another country."""
+    body = normalize(job.get("description") or "")
+    for pattern in rules.get("work_permit_patterns", []):
+        match = re.search(pattern, body)
+        if match:
+            return f"Excluida: exige residencia o permiso de trabajo en otro país («{match.group(0)[:80]}»)"
+    return ""
+
+
+def stack_matches(job: dict) -> list[str]:
+    """Candidate's own stack (config.json → scoring.skills) named in the posting."""
+    text = normalize(job.get("description") or "")
+    body = " " + re.sub(r"[^a-z0-9.+#]+", " ", text) + " " + re.sub(r"[^a-z0-9+#]+", " ", text) + " "
+    return [s for s in radar.scoring()["skills"] if " " + s + " " in body]
 
 
 def _words(text: str) -> str:
@@ -1454,11 +1525,20 @@ def excluded(job: dict, cfg: dict) -> str:
             normalize(n) and normalize(n) in company for n in rules.get("onsite_ok_companies", [])):
         if reason := not_remote(job):
             return reason
+    if reason := location_block(job, rules):
+        return reason
+    if reason := work_permit_block(job, rules):
+        return reason
     limit = int(rules.get("max_years") or 0)
     if limit and job.get("description"):
         years = required_years(job["description"])
         if years > limit:
             return f"Excluida por experiencia: pide {years}+ años (máximo configurado {limit})"
+        # Above stack_years only when the posting asks for the candidate's own stack (2026-11-16).
+        stack_years, need = int(rules.get("stack_years") or 0), int(rules.get("min_stack_matches") or 0)
+        if stack_years and years > stack_years and len(stack_matches(job)) < need:
+            return (f"Excluida por experiencia: pide {years}+ años y el stack no coincide "
+                    f"(menos de {need} tecnologías tuyas en el aviso)")
     return cloud_block(job, cfg) if job.get("description") else ""
 
 
@@ -1477,8 +1557,31 @@ def apply_exclusions(cfg: dict, statuses: tuple[str, ...] = ("new", "manual", "a
     return moved
 
 
+def linkedin_easy(cfg: dict) -> dict:
+    """LinkedIn «Solicitud sencilla» by the form agent on the user's own LinkedIn session. Off by default: it is the
+    main risk of LinkedIn restricting the account, so it has its own small daily cap."""
+    return {"enabled": False, "max_per_day": 3, **cfg.get("linkedin_easy_apply", {})}
+
+
+def is_easy_auto(job: dict, cfg: dict | None = None) -> bool:
+    """A LinkedIn alert whose button is «Solicitud sencilla» and the user turned on linkedin_easy_apply."""
+    return (job.get("source") == "linkedin_alert" and job.get("linkedin_apply") == "easy"
+            and bool(linkedin_easy(cfg or radar.config())["enabled"]))
+
+
+def linkedin_easy_today() -> int:
+    with connect() as db:
+        return db.execute("SELECT COUNT(*) n FROM events WHERE kind='linkedin_easy_apply' AND at >= ?",
+                          (local_now().replace(hour=0, minute=0, second=0, microsecond=0)
+                           .astimezone(timezone.utc).isoformat(timespec="seconds"),)).fetchone()["n"]
+
+
 def is_manual(job: dict) -> bool:
-    """LinkedIn offers are never auto-applied: the user applies by hand."""
+    """LinkedIn offers are not applied on LinkedIn by default: linkedin_bot finds the external «Solicitar» link
+    (applied by the agent as a 'linkedin_ext' offer); «Solicitud sencilla» stays for the user unless
+    linkedin_easy_apply is on."""
+    if is_easy_auto(job):
+        return False
     return job["source"] == "linkedin_alert" or "linkedin.com" in (job.get("url") or "").lower()
 
 
@@ -1490,6 +1593,9 @@ def triage_manual(cfg: dict) -> int:
         for row in filter(is_manual, rows):
             db.execute("UPDATE jobs SET status='manual', updated_at=? WHERE id=?", (now(), row["id"]))
             moved += 1
+        if linkedin_easy(cfg)["enabled"]:  # Easy Apply turned on: those LinkedIn offers go to the agent's queue
+            db.execute("""UPDATE jobs SET status='new', updated_at=? WHERE status='manual'
+                          AND source='linkedin_alert' AND linkedin_apply='easy'""", (now(),))
     return moved
 
 
