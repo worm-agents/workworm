@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
 from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse
 from zoneinfo import ZoneInfo
@@ -80,7 +81,7 @@ SOURCES = {
                 "No se postula: sigue la conversación y no responde, salvo que lo actives en esa conversación"),
     "linkedin_alert": ("LinkedIn", "Alertas de empleo recibidas en Gmail + descripción pública del aviso",
                        "Manual: el agente deja el link listo, te postulás vos y él sigue la conversación"),
-    "indeed": ("Indeed Argentina", "Búsqueda con JobSpy (scraping del sitio público)",
+    "indeed": ("Indeed", "Búsqueda con JobSpy (Argentina, y EE.UU. solo remoto según config.json → indeed.extra_searches)",
                "Formulario de Indeed o del sitio de la empresa, con el navegador del agente"),
     "getonbrd": ("Get on Board", "API pública de búsqueda", "Formulario de Get on Board (requiere sesión iniciada en el Edge del agente)"),
     "greenhouse": ("Greenhouse", "API pública de cada empresa configurada", "Formulario de Greenhouse, con el navegador del agente"),
@@ -99,6 +100,8 @@ SOURCES = {
     "himalayas": ("Himalayas", "API pública de empleos remotos", "Formulario de la empresa, con el navegador del agente"),
     "remotive": ("Remotive", "API pública de empleos remotos", "Formulario de la empresa, con el navegador del agente"),
     "jobicy": ("Jobicy", "API pública de empleos remotos", "Formulario de la empresa, con el navegador del agente"),
+    "remoteok": ("Remote OK", "API pública de empleos remotos", "Formulario de la empresa, con el navegador del agente"),
+    "weworkremotely": ("We Work Remotely", "RSS por categoría (programación)", "Formulario de la empresa, con el navegador del agente"),
 }
 TECH = ("python", "sql", "pyspark", "spark", "databricks", "airflow", "dbt", "snowflake", "bigquery",
         "redshift", "aws", "azure", "gcp", "google cloud", "azure data factory", "synapse", "fabric",
@@ -310,16 +313,15 @@ def job_score(job: dict) -> tuple[int, str]:
     if future:
         score += min(sum(sc["bonus"][s] for s in future), 7)
         reasons.append("Interés: " + ", ".join(future[:2]))
+    # Foreign offers are welcome (remote for a company abroad, 2026-11-16): no location penalty. Eligibility
+    # (work permit, relocation, on-site abroad) is decided by agent.excluded() and the LLM, not by the score.
     if at_home(location):
         score += 5
     elif "remote" in location or "remoto" in location or normalize(job.get("remote", "")) == "remote":
         score += 3
-    elif location and not any(x in location for x in (*home()["region_terms"], "worldwide")):
-        score -= 12
-        reasons.append("Revisar ubicación o elegibilidad")
-    if any(x in body for x in ("5+ years", "5 years", "5 anos", "5 anios", "5 años")):
+    if re.search(r"\b([7-9]|1[0-5])\s*\+?\s*(years|anos|anios)", body):
         score -= 17
-        reasons.append("Puede pedir más experiencia")
+        reasons.append("Puede pedir 7 o más años")
     return max(0, min(100, score)), "; ".join(reasons)
 
 
@@ -372,7 +374,7 @@ def eligible_location(job: dict) -> bool:
         return True
     location = normalize(job.get("location", ""))
     h = home()
-    if job.get("source") in ("himalayas", "remotive", "jobicy"):
+    if job.get("source") in ("himalayas", "remotive", "jobicy", "remoteok", "weworkremotely"):
         # Remote boards state explicit country restrictions; accept only ones that include the home country.
         return at_home(location) or any(x in location for x in (*h["region_terms"], "americas", "worldwide",
                                                                  "anywhere")) or location == ""
@@ -392,7 +394,7 @@ def eligible_location(job: dict) -> bool:
 
 # ---------- direct employer links (Indeed and Himalayas block the server's browser with Cloudflare) ----------
 
-BLOCKED_AGGREGATORS = ("himalayas.app", "indeed.com")
+BLOCKED_AGGREGATORS = ("himalayas.app", "indeed.com", "weworkremotely.com")  # Cloudflare walls
 
 
 def blocked_aggregator(url: str) -> bool:
@@ -620,16 +622,62 @@ SPANISH_MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio"
                   "octubre", "noviembre", "diciembre")
 
 
+SA_MODES = {"remoto": "remote", "remote": "remote", "remote friendly": "remote", "hibrido": "hybrid",
+            "hybrid": "hybrid", "presencial": "onsite", "on-site": "onsite", "onsite": "onsite"}
+SA_AGE = re.compile(r"^(hoy|ayer|anteayer|today|yesterday|hace (\d+|un|una) (minuto|hora|dia|semana|mes|ano)(e?s)?|"
+                    r"(\d+|a|an) (minute|hour|day|week|month|year)s? ago)$")
+
+
+def _sa_age(text: str) -> str:
+    """'hoy', 'ayer', 'hace 3 semanas'… → approximate ISO date (the detail page has the exact one)."""
+    text = normalize(text)
+    days = {"hoy": 0, "today": 0, "ayer": 1, "yesterday": 1, "anteayer": 2}.get(text)
+    if days is None:
+        m = re.search(r"(\d+|un|una|a|an) (minuto|hora|dia|semana|mes|ano|minute|hour|day|week|month|year)", text)
+        if not m:
+            return ""
+        n = 1 if m.group(1) in ("un", "una", "a", "an") else int(m.group(1))
+        unit = {"minuto": 0, "minute": 0, "hora": 0, "hour": 0, "dia": 1, "day": 1, "semana": 7, "week": 7,
+                "mes": 30, "month": 30, "ano": 365, "year": 365}[m.group(2)]
+        days = n * unit
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+
+
 def parse_startupsargentina_list(html: str) -> tuple[list[dict], int]:
-    """Cards of one /empleos page plus the total page count ("Página 1 de 18")."""
+    """Cards of one /empleos page plus the total page count ("Página 1 de 18").
+    Since 2026-11 the site is a list of <a href="/empleos/<startup>/<uuid>/<slug>"> rows with <strong>title</strong>
+    and <span><b>Company</b> · place · mode · age</span>; the old <article> cards are still read."""
     soup = BeautifulSoup(html, "html.parser")
     found = []
+    for row in soup.select('a[href^="/empleos/"]'):
+        strong = row.find("strong")
+        parts = row["href"].split("?")[0].strip("/").split("/")
+        if not strong or len(parts) < 3:
+            continue
+        meta = strong.find_next_sibling("span")  # (the first <span> of the row is the logo's initials)
+        company_node = meta.find("b") if meta else None
+        company = company_node.get_text(" ", strip=True) if company_node else parts[1]
+        if company_node:
+            company_node.extract()
+        bits = [b.strip() for b in (meta.get_text(" ", strip=True) if meta else "").split("·") if b.strip()]
+        mode, posted, places = "", "", []
+        for bit in bits:
+            key = normalize(bit)
+            if key in SA_MODES and not mode:
+                mode = SA_MODES[key]
+            elif SA_AGE.match(key):
+                posted = _sa_age(key)
+            else:
+                places.append(bit)
+        found.append({"source": "startupsargentina", "external_id": parts[2], "title": strong.get_text(" ", strip=True),
+                      "company": company, "location": " / ".join(places), "remote": mode,
+                      "url": STARTUPS_AR + "/" + "/".join(parts), "description": "", "posted_at": posted})
     for card in soup.select("article"):
         link = card.select_one('h2 a[href^="/empleos/"]')
         if not link:
             continue
         parts = link["href"].strip("/").split("/")  # empleos/<startup>/<uuid>/<slug>
-        if len(parts) < 3:
+        if len(parts) < 3 or any(j["external_id"] == parts[2] for j in found):
             continue
         company = card.select_one('p a[href^="/startups/"]')
         place = card.find("span", recursive=False)
@@ -676,11 +724,14 @@ def fetch_startupsargentina(cfg: dict) -> list[dict]:
     conf = cfg.get("startupsargentina", {})
     session, found, seen = browser_session(), [], set()
     page, pages = 1, 1
+    # /empleos redirects to /en/empleos since 2026-11: ask for the Spanish pages (dates are parsed in Spanish).
     while page <= min(pages, int(conf.get("max_pages", 25))):
-        response = session.get(f"{STARTUPS_AR}/empleos", params={"page": page} if page > 1 else None, timeout=25)
+        response = session.get(f"{STARTUPS_AR}/es/empleos", params={"page": page} if page > 1 else None, timeout=25)
         response.raise_for_status()
         cards, pages = parse_startupsargentina_list(response.text)
         if not cards:
+            if page == 1:  # the site changed its HTML again: say so instead of silently adding nothing
+                raise RuntimeError("no se encontró ninguna oferta en el listado (¿cambió el HTML del sitio?)")
             break
         for job in cards:
             if job["external_id"] not in seen:
@@ -702,8 +753,12 @@ def fetch_startupsargentina(cfg: dict) -> list[dict]:
             continue
         if fetched >= limit or job["external_id"] in repeated or not target_role(job):
             continue
-        response = session.get(job["url"], timeout=25)
-        response.raise_for_status()
+        try:
+            response = session.get(job["url"].replace(STARTUPS_AR + "/empleos/", STARTUPS_AR + "/es/empleos/", 1),
+                                   timeout=25)
+            response.raise_for_status()
+        except requests.RequestException:
+            continue  # one broken offer page must not drop the whole source
         detail = parse_startupsargentina_detail(response.text)
         job.update(description=detail["description"], posted_at=detail["posted_at"])
         if detail["apply_url"]:
@@ -713,8 +768,13 @@ def fetch_startupsargentina(cfg: dict) -> list[dict]:
     return found
 
 
+REMOTE_ERRORS: list[str] = []
+
+
 def fetch_remote_boards(cfg: dict) -> list[dict]:
-    """Remote job boards with public APIs: Himalayas, Remotive and Jobicy. Location filtering happens in collect()."""
+    """Remote job boards with public APIs: Himalayas, Remotive, Jobicy, Remote OK and We Work Remotely.
+    Location filtering happens in collect()."""
+    REMOTE_ERRORS.clear()
     session, found, errors = browser_session(), [], []
     for term in cfg["search_terms"]:
         try:
@@ -745,6 +805,63 @@ def fetch_remote_boards(cfg: dict) -> list[dict]:
                           "posted_at": x.get("pubDate", "")})
     except Exception as exc:
         errors.append(f"Jobicy: {exc}")
+    conf = cfg.get("remote_boards", {})
+    if conf.get("remoteok"):
+        try:  # Remote OK public API (first item is the legal notice)
+            data = session.get("https://remoteok.com/api", timeout=25).json()
+            for x in data[1:]:
+                if not x.get("id") or not x.get("position"):
+                    continue
+                found.append({"source": "remoteok", "external_id": str(x["id"]), "title": x["position"],
+                              "company": x.get("company", ""), "location": x.get("location") or "Worldwide",
+                              "remote": "remote", "url": x.get("apply_url") or x.get("url", ""),
+                              "description": clean_html(x.get("description", "")),
+                              "posted_at": x.get("date", "")})
+        except Exception as exc:
+            errors.append(f"Remote OK: {exc}")
+    for category in conf.get("weworkremotely") or []:
+        try:  # We Work Remotely RSS per category; <region> is who can apply
+            response = session.get(f"https://weworkremotely.com/categories/{category}.rss", timeout=25)
+            response.raise_for_status()
+            for item in BeautifulSoup(response.text, "xml").find_all("item"):
+                head = item.find("title").get_text(strip=True) if item.find("title") else ""
+                company, _, title = head.partition(": ")
+                link = item.find("link").get_text(strip=True) if item.find("link") else ""
+                if not title or not link:
+                    continue
+                pub = item.find("pubDate")
+                posted = ""
+                if pub:
+                    try:
+                        posted = parsedate_to_datetime(pub.get_text(strip=True)).isoformat()
+                    except (TypeError, ValueError):
+                        pass
+                found.append({"source": "weworkremotely", "external_id": link, "title": title, "company": company,
+                              "location": item.find("region").get_text(strip=True) if item.find("region") else "",
+                              "remote": "remote", "url": link,
+                              "description": clean_html(item.find("description").get_text() if item.find("description") else ""),
+                              "posted_at": posted})
+        except Exception as exc:
+            errors.append(f"We Work Remotely ({category}): {exc}")
+    # We Work Remotely job pages sit behind Cloudflare: keep only offers whose employer form (Lever, Greenhouse,
+    # Ashby...) is found; already stored ones keep the link they got.
+    wwr = [j for j in found if j["source"] == "weworkremotely"]
+    if wwr:
+        with connect() as db:
+            known = {r["external_id"]: r["url"] for r in db.execute(
+                "SELECT external_id, url FROM jobs WHERE source='weworkremotely'")}
+        keep = []
+        for job in wwr:
+            if job["external_id"] in known:
+                job["url"] = known[job["external_id"]]
+                keep.append(job)
+            elif target_role(job) and eligible_location(job):
+                direct = employer_url(job, session)
+                if direct:
+                    keep.append({**job, "url": direct})
+        found = [j for j in found if j["source"] != "weworkremotely"] + keep
+    if errors:
+        REMOTE_ERRORS[:] = errors
     if errors and not found:
         raise RuntimeError("; ".join(errors))
     return found
@@ -833,26 +950,54 @@ def enrich(db: sqlite3.Connection, limit: int, errors: list) -> int:
 def fetch_indeed(cfg: dict) -> list[dict]:
     from jobspy import scrape_jobs
 
-    found = []
+    found, errors = [], []
     def cell(value) -> str:
         # JobSpy returns pandas NaN for absent fields.
         return "" if value is None or str(value).lower() in {"nan", "none", "nat"} else str(value)
-    for term in cfg["search_terms"]:
-        frame = scrape_jobs(site_name=["indeed"], search_term=term,
-                            location=cfg["indeed"]["location"],
-                            country_indeed=cfg["indeed"]["country"],
-                            results_wanted=cfg["indeed"]["results_per_query"], verbose=0)
-        for x in frame.to_dict("records"):
-            # The employer's own page when Indeed has it: the server's browser gets a Cloudflare wall on Indeed.
-            url = cell(x.get("job_url_direct")) or cell(x.get("job_url"))
-            if not url or url == "nan":
+    base = cfg["indeed"]
+    # One search per (country, term). `extra_searches` adds other Indeed countries (e.g. USA, remote only).
+    # JobSpy/Indeed accepts only one of: hours_old | is_remote (+job_type) | easy_apply per search.
+    searches = [{"country": base["country"], "location": base["location"], "results_per_query":
+                 base["results_per_query"], "hours_old": base.get("hours_old"), "terms": cfg["search_terms"]}]
+    searches += [{**s, "terms": s.get("terms") or cfg["search_terms"]} for s in base.get("extra_searches", [])]
+    for search in searches:
+        for term in search["terms"]:
+            options = {"is_remote": True} if search.get("is_remote") else \
+                      ({"hours_old": int(search["hours_old"])} if search.get("hours_old") else {})
+            try:
+                frame = scrape_jobs(site_name=["indeed"], search_term=term, location=search.get("location") or None,
+                                    country_indeed=search["country"], results_wanted=int(search["results_per_query"]),
+                                    verbose=0, **options)
+            except Exception as exc:  # one failed search must not drop the rest of Indeed
+                errors.append(f"{search['country']} «{term}»: {str(exc).splitlines()[0][:120]}")
                 continue
-            found.append({"source": "indeed", "external_id": cell(x.get("id")) or url,
-                          "title": cell(x.get("title")), "company": cell(x.get("company")),
-                          "location": cell(x.get("location")),
-                          "remote": "remote" if x.get("is_remote") is True else "",
-                          "url": url, "description": cell(x.get("description")),
-                          "posted_at": cell(x.get("date_posted"))})
+            rows = _indeed_rows(frame, cell)
+            if search is not searches[0]:  # abroad: only offers with the employer's own link (no Indeed tab)
+                rows = [r for r in rows if not blocked_aggregator(r["url"])]
+            found.extend(rows)
+    if errors and not found:
+        raise RuntimeError("; ".join(errors[:3]))
+    if errors:
+        INDEED_ERRORS[:] = errors
+    return found
+
+
+INDEED_ERRORS: list[str] = []
+
+
+def _indeed_rows(frame, cell) -> list[dict]:
+    found = []
+    for x in frame.to_dict("records"):
+        # The employer's own page when Indeed has it: the server's browser gets a Cloudflare wall on Indeed.
+        url = cell(x.get("job_url_direct")) or cell(x.get("job_url"))
+        if not url or url == "nan":
+            continue
+        found.append({"source": "indeed", "external_id": cell(x.get("id")) or url,
+                      "title": cell(x.get("title")), "company": cell(x.get("company")),
+                      "location": cell(x.get("location")),
+                      "remote": "remote" if x.get("is_remote") is True else "",
+                      "url": url, "description": cell(x.get("description")),
+                      "posted_at": cell(x.get("date_posted"))})
     return found
 
 
@@ -1004,10 +1149,12 @@ def collect() -> dict:
         except Exception as exc:
             errors.append(f"{board['provider']}:{board['token']}: {exc}")
     if cfg.get("indeed", {}).get("enabled"):
+        INDEED_ERRORS.clear()
         try:
             jobs.extend(fetch_indeed(cfg))
         except Exception as exc:
             errors.append(f"Indeed: {exc}")
+        errors.extend(f"Indeed (parcial): {e}" for e in INDEED_ERRORS[:5])
     if cfg.get("getonbrd", {}).get("enabled"):
         try:
             jobs.extend(fetch_getonbrd(cfg, session))
@@ -1021,6 +1168,8 @@ def collect() -> dict:
                 jobs.extend(fetch(cfg))
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
+            if key == "remote_boards":
+                errors.extend(f"Remotos (parcial): {e}" for e in REMOTE_ERRORS[:5])
     if cfg.get("gmail", {}).get("enabled"):
         try:
             service = gmail_service(role="alerts")

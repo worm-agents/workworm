@@ -813,5 +813,50 @@ class SameOfferAndManualApplyTests(unittest.TestCase):
         self.assertIsNone(agent.hold_info())
 
 
+SA_ROWS_2026_11 = (
+    '<main><p>Página 1 de 19</p><ul class="QJqgLW_list">'
+    '<li><a class="QJqgLW_row" href="/empleos/mercado-libre/15493dab-b11b-4d76-8886-49f1554771a1/analista-de-datos">'
+    '<div class="startup-logo"><span>ML</span><img alt=""/></div><div><strong>Analista de Datos</strong>'
+    '<span><b>Mercado Libre</b> · Capital Federal, Argentina · Híbrido · hoy</span></div></a></li>'
+    '<li><a class="QJqgLW_row" href="/empleos/technisys/81f28a04-afd4-4431-b8f1-0c62195e38ff/software-analyst">'
+    '<div class="startup-logo"><span>T</span></div><div><strong>Software Analyst</strong>'
+    '<span><b>Technisys</b> · Argentina · Colombia · hace 5 meses</span></div></a></li>'
+    '</ul></main>')
+
+
+class StartupsArgentina2026Tests(unittest.TestCase):
+    def test_list_rows_layout_of_november_2026(self):
+        jobs, pages = radar.parse_startupsargentina_list(SA_ROWS_2026_11)
+        self.assertEqual(pages, 19)
+        self.assertEqual([j["company"] for j in jobs], ["Mercado Libre", "Technisys"])
+        self.assertEqual(jobs[0]["title"], "Analista de Datos")
+        self.assertEqual(jobs[0]["location"], "Capital Federal, Argentina")
+        self.assertEqual(jobs[0]["remote"], "hybrid")
+        self.assertEqual(jobs[0]["external_id"], "15493dab-b11b-4d76-8886-49f1554771a1")
+        self.assertEqual(jobs[1]["location"], "Argentina / Colombia")  # the age is not a place
+        self.assertTrue(jobs[1]["posted_at"])
+
+
+class LocationRules2026Tests(unittest.TestCase):
+    RULES = {"local_places": ["caba", "capital federal", "buenos aires", "gba"],
+             "residency_regions": ["us", "united states", "uk"],
+             "work_permit_patterns": [r"authorized to work in (the )?(us|united states)\b"]}
+
+    def block(self, **job):
+        return agent.location_block({"title": "Data Engineer", "description": "", **job}, self.RULES) or \
+            agent.work_permit_block({"title": "Data Engineer", "description": "", **job}, self.RULES)
+
+    def test_remote_abroad_and_hybrid_in_caba_are_fine(self):
+        self.assertEqual(self.block(location="New York", remote="remote"), "")
+        self.assertEqual(self.block(location="Capital Federal", remote="Híbrido",
+                                    description="Híbrido: 2 días presencial en la oficina"), "")
+
+    def test_onsite_or_hybrid_outside_caba_gba_and_country_only_remote_are_out(self):
+        self.assertIn("fuera de CABA/GBA", self.block(location="Córdoba", remote="Presencial"))
+        self.assertIn("fuera de CABA/GBA", self.block(location="Bristol", description="Hybrid, 3 days in office"))
+        self.assertIn("residentes", self.block(location="Remote - US"))
+        self.assertIn("permiso", self.block(location="Remote", description="Must be authorized to work in the US."))
+
+
 if __name__ == "__main__":
     unittest.main()
