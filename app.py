@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import shutil
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -313,6 +314,15 @@ def gmail_expired() -> list[str]:
 
 for notice in dict.fromkeys(gmail_expired()):
     st.error(f"[!!] {notice}")
+
+if not shutil.which("claude"):
+    st.error("[!!] No encontré Claude Code (el comando `claude`). WorkWorm lo usa para decidir y redactar: instalalo "
+             "desde https://claude.com/claude-code, iniciá sesión con tu cuenta de Claude y reiniciá el tablero.")
+if not radar.CONFIG_PATH.exists():
+    st.info("[--] Primera vez: completá **Configuración → Cuentas y Gmail**, **Qué buscás** y **Tu perfil**. "
+            "El piloto automático arranca en pausa: no se envía nada hasta que lo actives.")
+elif not cfg.get("search_terms") or not radar.scoring()["role_terms"]:
+    st.warning("[!!] Falta configurar qué buscás (Configuración → Qué buscás): sin búsquedas ni cargos no entra ninguna oferta.")
 
 _sched = scheduler_status()
 if _sched["state"] in ("missing", "moved", "disabled"):
@@ -773,7 +783,7 @@ with tailoring_tab:
                                        ", ".join(ex.get("title_exceptions", [])),
                                        help="Ej.: «Semi Senior» no se excluye aunque contenga «Senior».")
             max_years = st.number_input("Máximo de años de experiencia que puede pedir el aviso (0 = sin límite)", 0, 15,
-                                        int(ex.get("max_years", 3)),
+                                        int(ex.get("max_years", 0)),
                                         help="Con 3, se excluye todo aviso que pida 4 años o más (no cuenta si dice «deseable»).")
             companies = st.text_input("Empresas baneadas: no se postula nunca a estas (separadas por coma)",
                                       ", ".join(ex["companies"]),
@@ -1126,9 +1136,38 @@ with settings_general:
             for error in json.loads(info["errors"]):
                 st.warning(error)
     with s2:
+        st.subheader("Qué buscás")
+        sc = cfg.setdefault("scoring", {})
+        with st.form("search"):
+            terms = st.text_area("Búsquedas que se lanzan en cada fuente (una por línea)",
+                                 "\n".join(cfg.get("search_terms", [])), height=110,
+                                 placeholder="analista contable\ncontador junior")
+            roles = st.text_area("Cargos que te sirven: palabras que tiene que tener el título (una por línea)",
+                                 "\n".join(sc.get("role_terms", [])), height=110,
+                                 placeholder="contable\ncontador\nanalista de cuentas",
+                                 help="Las ofertas cuyo título no tiene ninguna de estas palabras no entran.")
+            skills = st.text_area("Habilidades y su peso del 1 al 10 (una por línea, «habilidad: peso»)",
+                                  "\n".join(f"{k}: {v}" for k, v in sc.get("skills", {}).items()), height=110,
+                                  placeholder="excel: 9\nsap: 7\nliquidación de sueldos: 6",
+                                  help="Suben el puntaje de las ofertas que las piden. El puntaje solo ordena: no decide a qué se postula.")
+            if st.form_submit_button("Guardar búsqueda"):
+                lines = lambda text: list(dict.fromkeys(x.strip() for x in text.splitlines() if x.strip()))
+                weights = {}
+                for line in lines(skills):
+                    name, _, weight = line.rpartition(":")
+                    name, weight = (name or weight).strip(), weight.strip() if name else ""
+                    weights[name.lower()] = max(1, min(10, int(weight))) if weight.isdigit() else 5
+                cfg["search_terms"] = lines(terms)
+                sc.update(role_terms=[x.lower() for x in lines(roles)], main_titles=[x.lower() for x in lines(roles)],
+                          skills=weights)
+                save_config(cfg)
+                st.success("Búsqueda guardada")
+                st.rerun()
         st.subheader("Tu perfil y preferencias")
         path = radar.ROOT / cfg["profile_path"]
-        text = path.read_text(encoding="utf-8")
+        if not path.exists():
+            st.info("Todavía no guardaste tu perfil: abajo está la plantilla para completar.")
+        text = path.read_text(encoding="utf-8") if path.exists() else (radar.ROOT / "profile.example.md").read_text(encoding="utf-8")
         missing = text.count("COMPLETAR")
         if missing:
             st.warning(f"Hay {missing} datos marcados COMPLETAR. Si un reclutador pregunta por alguno, la postulación pasa a «Requiere tu atención».")

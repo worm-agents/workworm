@@ -18,32 +18,10 @@
       "docx": "C:/Users/TU_USUARIO/Documents/CV - English.docx"
     }
   ],
-  "search_terms": [
-    "data engineer",
-    "ingeniero de datos",
-    "etl developer",
-    "analytics engineer",
-    "azure data engineer",
-    "ingeniero de datos azure"
-  ],
+  "search_terms": [],
   "scoring": {
-    "role_terms": [
-      "data engineer",
-      "data & analytics engineer",
-      "ingeniero de datos",
-      "ingeniera de datos",
-      "etl",
-      "analytics engineer",
-      "dataops",
-      "data ops",
-      "ingenieria de datos",
-      "databricks developer"
-    ],
-    "main_titles": [
-      "data engineer",
-      "ingeniero de datos",
-      "ingeniera de datos"
-    ],
+    "role_terms": [],
+    "main_titles": [],
     "senior_terms": [
       "senior",
       "sr.",
@@ -55,74 +33,9 @@
       "manager",
       "jefe"
     ],
-    "skills": {
-      "python": 9,
-      "sql": 9,
-      "azure data factory": 8,
-      "adf": 8,
-      "sql server": 7,
-      "postgresql": 7,
-      "etl": 8,
-      "power bi": 5,
-      "airflow": 5,
-      "n8n": 4,
-      "docker": 3,
-      "metabase": 3,
-      "data governance": 3,
-      "data lineage": 3
-    },
-    "bonus": {
-      "databricks": 3,
-      "pyspark": 2,
-      "spark": 2,
-      "lakehouse": 2
-    },
-    "technologies": [
-      "python",
-      "sql",
-      "pyspark",
-      "spark",
-      "databricks",
-      "airflow",
-      "dbt",
-      "snowflake",
-      "bigquery",
-      "redshift",
-      "aws",
-      "azure",
-      "gcp",
-      "google cloud",
-      "azure data factory",
-      "synapse",
-      "fabric",
-      "kafka",
-      "docker",
-      "kubernetes",
-      "terraform",
-      "power bi",
-      "tableau",
-      "looker",
-      "postgresql",
-      "sql server",
-      "mysql",
-      "mongodb",
-      "scala",
-      "java",
-      "fivetran",
-      "airbyte",
-      "n8n",
-      "pandas",
-      "delta lake",
-      "glue",
-      "lambda",
-      "s3",
-      "etl",
-      "elt",
-      "data lake",
-      "data warehouse",
-      "git",
-      "ci/cd"
-    ]
+    "skills": {},
+    "bonus": {},
+    "technologies": []
   },
   "home": {
     "country": "Argentina",
@@ -160,7 +73,7 @@
     ]
   },
   "autopilot": {
-    "enabled": true,
+    "enabled": false,
     "model": "sonnet",
     "max_applications_per_day": 10,
     "apply_hours": [
@@ -244,23 +157,16 @@
     "fallback": "es"
   },
   "exclusions": {
-    "title_keywords": [
-      "Senior",
-      "Sr",
-      "Staff",
-      "Principal",
-      "Lead",
-      "Head of"
-    ],
+    "title_keywords": [],
     "title_exceptions": [
       "Semi Senior",
       "Semi-Senior",
       "Semisenior",
       "SSr"
     ],
-    "max_years": 3,
+    "max_years": 0,
     "companies": [],
-    "rules": "- No postular si exige 4 o más años de experiencia como requisito excluyente.\n- No postular si no acepta candidatos que vivan en mi país (si no lo aclara, postular igual)."
+    "rules": "- No postular si no acepta candidatos que vivan en mi país (si no lo aclara, postular igual)."
   },
   "lifeprime": {
     "enabled": false,

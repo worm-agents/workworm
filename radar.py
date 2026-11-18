@@ -30,16 +30,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
 ]
 USER_AGENT = "WorkWorm/1.0 (job search assistant)"
-# Scoring and home-country defaults; config.json → scoring / home overrides them (see config.example.json).
-SKILLS = {
-    "python": 9, "sql": 9, "azure data factory": 8, "adf": 8,
-    "sql server": 7, "postgresql": 7, "etl": 8, "power bi": 5,
-    "airflow": 5, "n8n": 4, "docker": 3, "metabase": 3,
-    "data governance": 3, "data lineage": 3,
-}
-BONUS = {"databricks": 3, "pyspark": 2, "spark": 2, "lakehouse": 2}
-ROLE_TERMS = ("data engineer", "data & analytics engineer", "ingeniero de datos", "ingeniera de datos", "etl", "analytics engineer", "dataops", "data ops", "ingenieria de datos", "databricks developer")
-MAIN_TITLES = ("data engineer", "ingeniero de datos", "ingeniera de datos")
+# Scoring defaults are empty: each user sets what they search in config.json → scoring (or in the
+# dashboard, Configuración → Qué buscás). The home country defaults to Argentina, the only one supported for now.
+SKILLS: dict[str, int] = {}
+BONUS: dict[str, int] = {}
+ROLE_TERMS: tuple[str, ...] = ()
+MAIN_TITLES: tuple[str, ...] = ()
 SENIOR_TERMS = ("senior", "sr.", "lead", "principal", "staff", "architect", "gerente", "manager", "jefe")
 EMAIL_RE = re.compile(r"(?<![\w.+-])([\w.+-]+@[\w.-]+\.[A-Za-z]{2,})(?![\w.-])")
 JOB_URL_RE = re.compile(r"https?://(?:www\.)?linkedin\.com/(?:comm/)?jobs/view/(\d+)", re.I)
@@ -519,7 +515,7 @@ def fetch_remote_boards(cfg: dict) -> list[dict]:
         except Exception as exc:
             errors.append(f"Remotive: {exc}")
     try:
-        data = session.get("https://jobicy.com/api/v2/remote-jobs", params={"count": 50, "tag": cfg["search_terms"][0]}, timeout=25).json()
+        data = session.get("https://jobicy.com/api/v2/remote-jobs", params={"count": 50, "tag": (cfg["search_terms"] or [""])[0]}, timeout=25).json()
         for x in data.get("jobs", []):
             found.append({"source": "jobicy", "external_id": str(x["id"]), "title": x["jobTitle"],
                           "company": x.get("companyName", ""), "location": x.get("jobGeo") or "Worldwide",
@@ -744,6 +740,8 @@ def collect() -> dict:
     cfg = config()
     started = now()
     jobs, errors = [], []
+    if not cfg.get("search_terms") or not scoring()["role_terms"]:
+        errors.append("Falta configurar qué buscás (Configuración → Qué buscás): sin búsquedas ni cargos no entra ninguna oferta")
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
     for board in cfg.get("boards", []):

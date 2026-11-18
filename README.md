@@ -15,8 +15,11 @@ Tablero local que busca ofertas de trabajo, las ordena según tu perfil y, si lo
 
 Todo corre en tu computadora. No hay servidor ni cuenta de WorkWorm.
 
+**Por ahora WorkWorm está pensado para buscar trabajo en Argentina**: las fuentes locales (Computrabajo, Bumeran, Indeed) apuntan a Argentina y la elegibilidad de las ofertas se calcula con `config.json → home`.
+
 ## ⚠️ Antes de usarlo
 
+- El piloto automático **arranca en pausa**: hasta que lo actives, WorkWorm solo busca y ordena ofertas, no envía nada.
 - Con el piloto automático activo, el agente **manda correos y postulaciones en tu nombre**. Revisá `profile.md`, las reglas de exclusión y el límite diario antes de activarlo.
 - Algunas fuentes se leen con scraping de páginas públicas (Indeed, Computrabajo, Bumeran). Pueden dejar de funcionar si cambian los sitios.
 - `linkedin_bot.py` abre avisos de LinkedIn en el navegador del agente para encontrar el link externo de postulación. Nunca postula en LinkedIn, pero automatizar LinkedIn puede ir contra sus términos de uso. Usalo bajo tu responsabilidad.
@@ -27,7 +30,7 @@ Todo corre en tu computadora. No hay servidor ni cuenta de WorkWorm.
 La versión actual funciona **solo en Windows 10/11**.
 
 - Python 3.13 (la versión con la que se prueba).
-- [Claude Code](https://claude.com/claude-code) instalado y con sesión iniciada: el agente usa `claude -p` con tu suscripción.
+- [Claude Code](https://claude.com/claude-code) instalado y con sesión iniciada con tu cuenta de Claude: el agente usa `claude -p` con tu suscripción. Por ahora no funciona con otros modelos. Si falta, el tablero lo avisa arriba.
 - Node.js 18 o superior (`npx` levanta Playwright MCP para completar formularios).
 - Microsoft Edge (navegador del agente) y Microsoft Word (convierte el CV adaptado a PDF).
 - Una cuenta de Gmail y un proyecto propio en Google Cloud para la API de Gmail.
@@ -43,10 +46,11 @@ Copy-Item config.example.json config.json
 Copy-Item profile.example.md profile.md
 ```
 
-Después completá:
+El ejemplo viene vacío a propósito: no trae ningún cargo ni habilidad. Después completá, desde el tablero o a mano:
 
-1. **`profile.md`**: tus datos, preferencias y límites. El agente lo lee antes de cada correo. Donde quede `COMPLETAR`, no inventa: te pregunta.
-2. **`config.json`**: como mínimo `candidate_name`, `candidate_email`, `cvs` (rutas a tu CV en PDF y .docx), `search_terms`, `scoring` y `home`.
+1. **Qué buscás** (Configuración → Qué buscás): las búsquedas, las palabras que tiene que tener el título del cargo y tus habilidades con su peso. Sin esto no entra ninguna oferta.
+2. **`profile.md`** (Configuración → Tu perfil): tus datos, preferencias y límites. El agente lo lee antes de cada correo. Donde quede `COMPLETAR`, no inventa: te pregunta.
+3. **`config.json`**: `cvs` (rutas a tu CV en PDF y .docx). Opcional: `exclusions` (por ejemplo, palabras como «Senior» en el título o un máximo de años) y `home` si vivís fuera de las ciudades listadas.
 
 `config.json` y `profile.md` están en `.gitignore`: nunca se suben.
 

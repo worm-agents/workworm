@@ -9,6 +9,10 @@ import agent
 import tailor
 import radar
 
+# The tests run against a fixed profile (a data engineer in Argentina), never the user's config.json
+# nor config.example.json, which ships empty.
+radar.CONFIG_PATH = radar.EXAMPLE_CONFIG_PATH = Path(__file__).parent / "fixtures" / "config.test.json"
+
 
 ALERT = """Tu alerta de empleo para Ingeniero de datos en Argentina
 Databricks Developer
@@ -655,6 +659,17 @@ class GmailExpiryTests(unittest.TestCase):
                      patch.object(agent, "progress"), patch.object(agent, "queue_size", return_value=0):
                     report = agent.run()
         self.assertTrue(any("Venció la autorización de Gmail" in e for e in report["errors"]))
+
+
+class ExampleConfigTests(unittest.TestCase):
+    def test_example_ships_neutral_with_autopilot_off(self):
+        import json
+        cfg = json.loads((Path(__file__).parent.parent / "config.example.json").read_text(encoding="utf-8"))
+        self.assertFalse(cfg["autopilot"]["enabled"])
+        self.assertEqual(cfg["search_terms"], [])
+        self.assertEqual((cfg["scoring"]["role_terms"], cfg["scoring"]["skills"]), ([], {}))
+        self.assertEqual(cfg["home"]["country"], "Argentina")
+
 
 if __name__ == "__main__":
     unittest.main()

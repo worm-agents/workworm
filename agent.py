@@ -624,12 +624,11 @@ def needs_account(service, job: dict, cfg: dict, site: str, reason: str, result:
 
 
 EXCLUSION_DEFAULTS = {
-    "title_keywords": ["Senior", "Sr", "Staff", "Principal", "Lead", "Head of"],
+    "title_keywords": [],
     "title_exceptions": ["Semi Senior", "Semi-Senior", "Semisenior", "SSr"],
-    "max_years": 3,
+    "max_years": 0,
     "companies": [],
-    "rules": "- No postular si exige 6 o más años de experiencia como requisito excluyente.\n"
-             "- No postular si no acepta candidatos que vivan en mi país.",
+    "rules": "- No postular si no acepta candidatos que vivan en mi país.",
 }
 
 

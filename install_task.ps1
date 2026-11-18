@@ -25,7 +25,7 @@ Register-ScheduledTask -TaskName 'WorkWorm' -Action $agent -Trigger @($atLogon, 
 
 # Dashboard: http://127.0.0.1:8501 at logon, kept running.
 $board = New-ScheduledTaskAction -Execute $pythonw -Argument "$launcher board" -WorkingDirectory $PSScriptRoot
-# Delay + retries: at logon the D: drive may not be ready yet (task failed with 0x80070002).
+# Delay + retries: at logon a secondary drive (where the project may live) may not be ready yet (0x80070002).
 $boardSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1)
 $boardLogon = New-ScheduledTaskTrigger -AtLogOn -User $user
 $boardLogon.Delay = 'PT1M'
