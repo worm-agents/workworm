@@ -1,6 +1,8 @@
 # WorkWorm 🪱
 
-Tablero local que busca ofertas de trabajo, las ordena según tu perfil y, si lo activás, postula y sigue las conversaciones por correo con ayuda de Claude.
+Tablero local que busca ofertas de trabajo en Argentina, las ordena según tu perfil y, si lo activás, postula y sigue las conversaciones por correo con ayuda de Claude.
+
+Es parte de [Worm Agents](https://worm-agents.com), una familia de agentes de IA open source.
 
 > **English:** WorkWorm is a local, Windows-only job-search dashboard (Streamlit + SQLite). It collects offers from several job boards and LinkedIn alerts, scores them against your profile and can run an autopilot that tailors your CV, applies by email or web form and follows up with recruiters through Gmail, using the Claude Code CLI. The UI and prompts are in Spanish.
 
@@ -159,7 +161,7 @@ Las cuatro rutas están en `.gitignore`. No las publiques. El texto de las ofert
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
-Los tests no necesitan `config.json` ni `profile.md`: sin ellos usan `config.example.json`. Los aportes son bienvenidos. Abrí un issue antes de un cambio grande y agregá tests para lo que cambies.
+Los tests no necesitan `config.json` ni `profile.md`: usan la configuración de `tests/fixtures/config.test.json`. GitHub Actions los corre en Windows en cada push y PR. Los aportes son bienvenidos. Abrí un issue antes de un cambio grande y agregá tests para lo que cambies.
 
 ## Licencia
 
