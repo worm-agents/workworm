@@ -370,8 +370,8 @@ with board:
         sent_today = sum(1 for r in items if r["state"] == "sent" and (r["updated_at"] or "")[:10] == datetime.now(
             timezone.utc).date().isoformat())
         c1, c2, c3 = st.columns([2, 1, 1])
-        c1.caption(("Corriendo: el agente llena los formularios de a uno, con uno de ventaja. Vos resolvés el captcha, "
-                    "enviás y tocás «Enviado»." if on else
+        c1.caption(("Corriendo: el agente llena los formularios de a uno, con uno de ventaja. Vos resolvés el captcha y "
+                    "enviás en la pestaña: el agente se da cuenta solo (no hace falta volver acá)." if on else
                     "El agente llena cada formulario en el Chrome de la VM y vos solo resolvés el captcha y enviás. "
                     "Videos y cuentas nuevas no entran.") + f" Enviadas hoy en tandas: {sent_today}.")
         if on:
