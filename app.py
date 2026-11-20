@@ -356,6 +356,69 @@ with board:
     if not pilot.get("reply_to_recruiters", True):
         st.caption("> El agente no responde a ningún reclutador: sigue los correos y actualiza los estados. "
                    "Se cambia en Configuración → Piloto automático.")
+    # 2026-11-20, Jero: tanda de captchas. El agente llena, él solo resuelve el captcha y envía (tanda.py).
+    @st.fragment(run_every="5s")
+    def tanda_panel():
+        import tanda
+        importlib.reload(tanda)
+        items = tanda.rows()
+        pending = [r for r in items if r["state"] in tanda.OPEN_STATES]
+        on = tanda.active()
+        if not on and not pending and not tanda.candidates():
+            return
+        st.markdown("### Tanda de captchas")
+        sent_today = sum(1 for r in items if r["state"] == "sent" and (r["updated_at"] or "")[:10] == datetime.now(
+            timezone.utc).date().isoformat())
+        c1, c2, c3 = st.columns([2, 1, 1])
+        c1.caption(("Corriendo: el agente llena los formularios de a uno, con uno de ventaja. Vos resolvés el captcha, "
+                    "enviás y tocás «Enviado»." if on else
+                    "El agente llena cada formulario en el Chrome de la VM y vos solo resolvés el captcha y enviás. "
+                    "Videos y cuentas nuevas no entran.") + f" Enviadas hoy en tandas: {sent_today}.")
+        if on:
+            if c3.button("Terminar tanda", key="tanda-stop", width="stretch"):
+                tanda.stop()
+                st.rerun()
+        else:
+            if c2.button(f"▶ Empezar tanda ({len(pending) or len(tanda.candidates())})", key="tanda-start",
+                         type="primary", width="stretch"):
+                tanda.start()
+                st.rerun()
+        labels = {"ready": "LISTO: resolvé el captcha y enviá", "opening": "PASÁ LA VERIFICACIÓN y tocá «Listo»",
+                  "checked": "verificado, el agente está llenando", "filling": "el agente está llenando",
+                  "queued": "en cola"}
+        for r in [x for x in items if x["state"] in ("ready", "opening")]:
+            box = st.container(border=True)
+            box.markdown(f"**{r['company']}** · {r['title']} — {labels[r['state']]}")
+            if r["detail"]:
+                box.caption(r["detail"][:400])
+            b1, b2, b3, b4 = box.columns(4)
+            if b1.button("Ver pestaña", key=f"tanda-show-{r['job_id']}", width="stretch"):
+                tanda.show(r["job_id"])
+            if r["state"] == "opening":
+                if b2.button("Listo, ya pasé la verificación", key=f"tanda-chk-{r['job_id']}", type="primary", width="stretch"):
+                    tanda.checked(r["job_id"])
+                    st.rerun()
+            else:
+                if b2.button("Enviado → siguiente", key=f"tanda-sent-{r['job_id']}", type="primary", width="stretch"):
+                    tanda.sent(r["job_id"])
+                    st.rerun()
+            if b3.button("No salió", key=f"tanda-fail-{r['job_id']}", width="stretch"):
+                tanda.failed(r["job_id"], "Jero marcó que no salió")
+                st.rerun()
+            if b4.button("Saltear", key=f"tanda-skip-{r['job_id']}", width="stretch"):
+                tanda.skip(r["job_id"])
+                st.rerun()
+        rest = [x for x in items if x["state"] in ("checked", "filling", "queued")]
+        if rest:
+            st.caption("Después: " + " · ".join(f"{x['company']} ({labels[x['state']]})" for x in rest[:12])
+                       + (f" y {len(rest) - 12} más" if len(rest) > 12 else ""))
+        failed = [x for x in items if x["state"] == "failed"]
+        if failed:
+            with st.expander(f"No salieron en la tanda ({len(failed)})"):
+                for x in failed:
+                    st.markdown(f"**{x['company']}** · {x['title']}: {x['detail'][:300]}")
+
+    tanda_panel()
     attention_jobs = [j for j in radar.jobs("action_needed")]
     if attention_jobs:
         st.markdown(f"### [!!] Requieren tu atención · {len(attention_jobs)}")
