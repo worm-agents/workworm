@@ -383,7 +383,8 @@ with board:
                          type="primary", width="stretch"):
                 tanda.start()
                 st.rerun()
-        labels = {"ready": "LISTO: resolvé el captcha y enviá", "opening": "PASÁ LA VERIFICACIÓN y tocá «Listo»",
+        labels = {"ready": "LISTO: resolvé el captcha y enviá",
+                  "opening": "TE ESPERA: pasá la verificación o el captcha en la pestaña y tocá «Listo» (el agente sigue)",
                   "checked": "verificado, el agente está llenando", "filling": "el agente está llenando",
                   "queued": "en cola"}
         labels["failed"] = "EL AGENTE NO LO TERMINÓ: completá lo que falte y enviá, o «No salió»"
@@ -401,7 +402,15 @@ with board:
             if b1.button("Ver pestaña", key=f"tanda-show-{r['job_id']}", width="stretch"):
                 tanda.show(r["job_id"])
             if r["state"] == "opening":
-                if b2.button("Listo, ya pasé la verificación", key=f"tanda-chk-{r['job_id']}", type="primary", width="stretch"):
+                if b2.button("Listo, el agente sigue", key=f"tanda-chk-{r['job_id']}", type="primary", width="stretch"):
+                    tanda.checked(r["job_id"])
+                    st.rerun()
+            elif r["state"] == "failed":
+                if b2.button("Enviado → siguiente", key=f"tanda-sent-{r['job_id']}", type="primary", width="stretch"):
+                    tanda.sent(r["job_id"])
+                    st.rerun()
+                if box.button("Resolví el captcha: que el agente siga en esa pestaña", key=f"tanda-cont-{r['job_id']}",
+                              width="stretch"):
                     tanda.checked(r["job_id"])
                     st.rerun()
             else:
