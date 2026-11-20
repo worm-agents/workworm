@@ -1004,7 +1004,10 @@ FORM_FACTS = (
     "Cerrá solo las pestañas auxiliares que abriste vos.\n"
     "- Antes de dejarlo, releé cada campo ya cargado (por ejemplo el país del pasaporte) y completá lo que haya "
     "quedado vacío. Si al volver a mirar el formulario está vacío, cargalo de nuevo.\n"
-    "- No menciones pasos, verificaciones ni bloqueos (por ejemplo Cloudflare) que no viste en la pantalla.\n")
+    "- No menciones pasos, verificaciones ni bloqueos (por ejemplo Cloudflare) que no viste en la pantalla.\n"
+    "- Teléfono: si el formulario tiene el código de país aparte (bandera, +54), escribí solo los dígitos sin espacios ni "
+    "guiones (XXXXXXXXXX); si es un solo campo, +54XXXXXXXXXX. Después de cargar cada campo mirá si aparece un mensaje de "
+    "error («numbers only», «formato inválido», texto en rojo) y corregilo antes de dejarlo listo.\n")
 
 
 def personal_form_rules() -> str:
