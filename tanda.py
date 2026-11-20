@@ -425,10 +425,20 @@ def _watcher() -> None:
 
 def worker() -> None:
     import threading
-    cfg = radar.config()
     agent.ensure_browser()
     threading.Thread(target=_watcher, daemon=True).start()
     while not STOP.exists() and not idle():
+        try:
+            _step()
+        except Exception as exc:  # p. ej. «database is locked» mientras corre el ciclo: reintenta en 10 s
+            agent.debug_log(None, f"tanda: {type(exc).__name__}: {exc}")
+            time.sleep(10)
+    HEARTBEAT.unlink(missing_ok=True)
+
+
+def _step() -> None:
+    cfg = radar.config()  # cada vuelta: las reglas nuevas de config.json valen sin reiniciar
+    if True:
         HEARTBEAT.write_text(now(), encoding="utf-8")
         items = rows()
         waiting = [r for r in items if r["state"] in ("ready", "opening")]
@@ -447,16 +457,15 @@ def worker() -> None:
                        "instruction": (stale[0].get("instruction") or "") + " Este formulario ya estaba cargado hace un rato: "
                        "revisá que siga todo (CV adjunto, cada campo); si la sesión venció o la página se vació, tocá "
                        "Continue o recargá y volvé a llenarlo."}, cfg)
-                continue
+                return
             time.sleep(5)
-            continue
+            return
         if todo["state"] == "queued" and todo["mode"] == "start":
             tabs = _open_for_check(todo)
             _set(todo["job_id"], state="opening", tabs=json.dumps(tabs),
                  detail="Pasá la verificación en esa pestaña y tocá «Listo» en el tablero")
-            continue
+            return
         _fill(todo, cfg)
-    HEARTBEAT.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
