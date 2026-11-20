@@ -2523,10 +2523,22 @@ def handle_inbound(service, cfg: dict, app: dict, message: dict, report: dict, m
                 log_event(db, app["id"], "calendar", calendar_text)
         notify(service, cfg, f"Entrevista con {app['company']} — {when.astimezone(LOCAL_TZ):%a %d/%m %H:%M}" if when else f"Entrevista con {app['company']}",
                f"{app['title']} en {app['company']}\nCuándo: {result['interview_at']}\nLink: {result['interview_link'] or '(sin link todavía)'}\n"
-               + (f"{calendar_text}\n\n" if calendar_text else "\n") + f"{result['summary']}\n\nHilo: {link}")
+               + (f"{calendar_text}\n\n" if calendar_text else "\n") + f"{result['summary']}\n\n"
+               + form_answers_text(app["id"]) + f"Hilo: {link}")
         report["interviews"] += 1
     elif kind != "auto_ack" and app["status"] in ("applied", "action_needed"):
         radar.set_status(app["id"], "conversation")
+
+
+def form_answers_text(job_id: int) -> str:
+    """What the agent answered in the application form (salary, office days, English...), for the interview mail."""
+    with connect() as db:
+        row = db.execute("SELECT body FROM applications WHERE job_id=?", (job_id,)).fetchone()
+    body = (row[0] if row else "") or ""
+    marker = "Respuestas del formulario:"
+    if marker not in body:
+        return ""
+    return "Lo que se mandó en el formulario:\n" + body.split(marker, 1)[1].strip() + "\n\n"
 
 
 ACTION_HINT = re.compile(r"entrevista|interview|screening|agend|schedul|horario|disponibilidad|availability|assessment|"
