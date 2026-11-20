@@ -386,9 +386,15 @@ with board:
         labels = {"ready": "LISTO: resolvé el captcha y enviá", "opening": "PASÁ LA VERIFICACIÓN y tocá «Listo»",
                   "checked": "verificado, el agente está llenando", "filling": "el agente está llenando",
                   "queued": "en cola"}
-        for r in [x for x in items if x["state"] in ("ready", "opening")]:
+        labels["failed"] = "EL AGENTE NO LO TERMINÓ: completá lo que falte y enviá, o «No salió»"
+        cards = [x for x in items if x["state"] in ("ready", "opening")
+                 or (x["state"] == "failed" and x["tabs"] not in ("", "[]") and tanda.tab_info(x["tabs"]))]
+        for r in cards:
             box = st.container(border=True)
             box.markdown(f"**{r['company']}** · {r['title']} — {labels[r['state']]}")
+            where = tanda.tab_info(r["tabs"])
+            if where:
+                box.caption(f"Pestaña: {where}")
             if r["detail"]:
                 box.caption(r["detail"][:400])
             b1, b2, b3, b4 = box.columns(4)
@@ -412,11 +418,10 @@ with board:
         if rest:
             st.caption("Después: " + " · ".join(f"{x['company']} ({labels[x['state']]})" for x in rest[:12])
                        + (f" y {len(rest) - 12} más" if len(rest) > 12 else ""))
-        failed = [x for x in items if x["state"] == "failed"]
+        failed = [x for x in items if x["state"] == "failed" and x not in cards]
         if failed:
-            with st.expander(f"No salieron en la tanda ({len(failed)})"):
-                for x in failed:
-                    st.markdown(f"**{x['company']}** · {x['title']}: {x['detail'][:300]}")
+            st.caption(f"No salieron en la tanda ({len(failed)}, sin pestaña abierta; vuelven en la próxima): "
+                       + " · ".join(f"{x['company']}" for x in failed))
 
     tanda_panel()
     attention_jobs = [j for j in radar.jobs("action_needed")]
