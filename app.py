@@ -704,6 +704,49 @@ with analytics:
                 help=f"Avisos de LinkedIn para que te postules vos. Además hay "
                      f"{sum(1 for j in manual_jobs if not j.get('linkedin_apply'))} sin revisar por el agente.")
     st.divider()
+    # 2026-11-20, Jero: «quiero ver qué tanto ganamos o perdemos a medida que hacemos cambios» (metrics.py).
+    st.subheader("Evolución: qué rinde cada cambio")
+    try:
+        import altair as alt
+        import metrics
+        importlib.reload(metrics)
+        ev_days = st.select_slider("Días", options=[14, 30, 60], value=30, key="ev-days")
+        per_day = metrics.daily(ev_days)
+        rows = [{"día": d.isoformat(), "resultado": k, "cantidad": v}
+                for d, c in per_day.items() for k, v in c.items() if k != "descartada al leer"]
+        rates = [{"día": d.isoformat(), **metrics.summarize(c)} for d, c in per_day.items()]
+        marks = [{"día": c["date"], "cambio": c["title"]} for c in metrics.changes()
+                 if c["date"] >= (min(per_day) if per_day else datetime.now().date()).isoformat()]
+        if rows:
+            colors = alt.Scale(domain=metrics.OUTCOMES, range=["#2e7d32", "#66bb6a", "#e53935", "#8e24aa", "#fb8c00",
+                                                              "#fdd835", "#757575", "#bdbdbd", "#90a4ae", "#4fc3f7"])
+            bars = alt.Chart(pd.DataFrame(rows)).mark_bar().encode(
+                x=alt.X("día:T", title=None), y=alt.Y("sum(cantidad):Q", title="Intentos por resultado"),
+                color=alt.Color("resultado:N", scale=colors, sort=metrics.OUTCOMES), tooltip=["día:T", "resultado", "cantidad"])
+            rules = alt.Chart(pd.DataFrame(marks or [{"día": None, "cambio": ""}])).mark_rule(
+                strokeDash=[4, 3], color="#9e9e9e").encode(x="día:T", tooltip=["día:T", "cambio"])
+            st.altair_chart(alt.layer(bars, rules).properties(height=260), width="stretch")
+            rate_df = pd.DataFrame([r for r in rates if r["tasa"] is not None])
+            if not rate_df.empty:
+                line = alt.Chart(rate_df).mark_line(point=True, color="#2e7d32").encode(
+                    x=alt.X("día:T", title=None), y=alt.Y("tasa:Q", title="Enviadas / intentos", axis=alt.Axis(format="%")),
+                    tooltip=["día:T", alt.Tooltip("tasa:Q", format=".0%"), "intentos", "enviadas"])
+                st.altair_chart(alt.layer(line, rules).properties(height=180), width="stretch")
+            st.caption("Las líneas punteadas son los cambios (pasá el mouse para ver cuál). «Descartada al leer» no cuenta "
+                       "como intento: el agente decidió no postular al leer el aviso completo.")
+        st.markdown("<div class='panel-title'>Cada cambio: 7 días antes contra 7 días después</div>", unsafe_allow_html=True)
+        ba = pd.DataFrame(metrics.before_after())
+        if not ba.empty:
+            for col in ("tasa antes", "tasa después"):
+                ba[col] = ba[col].map(metrics.pct)
+            st.dataframe(ba.iloc[::-1], hide_index=True, width="stretch")
+        st.markdown("<div class='panel-title'>Por semana de envío: qué pasó después</div>", unsafe_allow_html=True)
+        coh = pd.DataFrame(metrics.cohorts())
+        if not coh.empty:
+            st.dataframe(coh.fillna(0).iloc[::-1], hide_index=True, width="stretch")
+    except Exception as exc:  # the rest of the tab must keep working
+        st.error(f"Evolución: {exc}")
+    st.divider()
     if not applied:
         st.info("Las analíticas de postulaciones aparecen cuando se envía el primer CV. Abajo, el panorama de ofertas encontradas.")
     a1, a2 = st.columns(2)
