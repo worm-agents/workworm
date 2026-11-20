@@ -31,7 +31,7 @@ import radar
 HEARTBEAT = radar.ROOT / "data" / "tanda.on"
 STOP = radar.ROOT / "data" / "tanda.stop"
 AHEAD = 3               # formularios listos (o esperando la verificación) por delante de Jero (Jero 20/11: «me abrió solo 3»)
-IDLE_MINUTES = 30       # sin ninguna acción de Jero, la tanda se pausa sola
+IDLE_MINUTES = 45       # sin ninguna acción de Jero (panel o captchas resueltos), la tanda se pausa sola
 FRESH_MINUTES = 15      # un formulario listo hace más que esto se revisa en su pestaña (las sesiones de los sitios vencen)
 VIDEO = re.compile(r"\bvideo|loom|spark ?hire|hirevue|grab(á|a)r", re.I)
 # Solo las señales claras de que la verificación está ANTES del formulario. Lo demás arranca en modo submit y, si el
@@ -360,9 +360,74 @@ def idle() -> bool:
     return time.time() - last > IDLE_MINUTES * 60
 
 
+PAGE_JS = r"""() => {
+  const filled = s => Array.from(document.querySelectorAll(s)).some(e => (e.value || '').length > 20);
+  const token = filled('textarea[name="h-captcha-response"]') || filled('textarea[name="g-recaptcha-response"]')
+             || filled('input[name="cf-turnstile-response"]');
+  const text = (document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 6000) : '');
+  const cloudflare = /just a moment|un momento|verifying you are human|verificando que|additional verification|security verification/i.test(text);
+  const success = /thank you for (applying|your application|your interest)|application (has been |was )?(submitted|received)|we('ve| have) received your application|gracias por (postularte|tu postulaci|aplicar|tu mensaje)|postulaci[oó]n (fue |ha sido )?(enviada|recibida)|mensaje ha sido enviado|successfully (submitted|applied)/i.test(text);
+  const captcha = !!document.querySelector('iframe[src*="hcaptcha"], iframe[src*="recaptcha"], iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"], .h-captcha, .g-recaptcha, .cf-turnstile');
+  return {token, cloudflare, captcha, success};
+}"""
+
+
+def _watch_once(seen_challenge: dict) -> None:
+    """Mira las pestañas que esperan a Jero. Así no tiene que volver al tablero (Jero 20/11: hacía los captchas en las
+    pestañas y la tanda seguía esperando su «Listo»):
+    - opening: si ya hay token de captcha, o había Cloudflare y ya no está → el agente sigue (checked);
+    - ready: si la página dice que la postulación salió → enviada."""
+    from playwright.sync_api import sync_playwright
+    waiting = {}
+    for r in rows():
+        if r["state"] in ("opening", "ready"):
+            for t in json.loads(r["tabs"] or "[]"):
+                waiting[t] = r
+    if not waiting:
+        return
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{agent.ASSIST_PORT}", timeout=15000)
+        for ctx in browser.contexts:
+            for page in ctx.pages:
+                try:
+                    session = ctx.new_cdp_session(page)
+                    target = session.send("Target.getTargetInfo")["targetInfo"]["targetId"]
+                    session.detach()
+                    r = waiting.get(target)
+                    if not r:
+                        continue
+                    state = page.evaluate(PAGE_JS)
+                except Exception:
+                    continue
+                job_id = r["job_id"]
+                if state["cloudflare"]:
+                    seen_challenge[job_id] = True
+                if r["state"] == "ready" and state["success"]:
+                    touch()
+                    sent(job_id)
+                elif (r["state"] == "opening" and not state["cloudflare"] and (state["token"] or not state["captcha"])
+                      and (datetime.now(timezone.utc) - radar.parse_time(r["updated_at"])).total_seconds() > 15):
+                    touch()
+                    _set(job_id, state="checked", detail="Pasaste la verificación: el agente sigue en esa pestaña")
+
+
+def _watcher() -> None:
+    """Hilo aparte: latido de la tanda (el llenado puede tardar varios minutos) y detección de lo que hace Jero."""
+    seen: dict = {}
+    while not STOP.exists() and not idle():
+        HEARTBEAT.write_text(now(), encoding="utf-8")
+        try:
+            _watch_once(seen)
+        except Exception:
+            pass
+        time.sleep(8)
+
+
 def worker() -> None:
+    import threading
     cfg = radar.config()
     agent.ensure_browser()
+    threading.Thread(target=_watcher, daemon=True).start()
     while not STOP.exists() and not idle():
         HEARTBEAT.write_text(now(), encoding="utf-8")
         items = rows()
