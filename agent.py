@@ -532,7 +532,7 @@ def tidy_screen(cfg: dict, report: dict | None = None) -> int:
     (offers, forms, logins, recruiter links, Workday, Zoom of an interview) and keeps everything else (Gmail, X, Gemini,
     other routines, keep_hosts). A form the user asked for from the dashboard in the last 3 h is kept. Pending work
     lives on the dashboard, where «Abrir» opens it again. Returns how many tabs it closed."""
-    if IS_WINDOWS or not browser_up():
+    if IS_WINDOWS or not browser_up() or tanda_active():
         return 0
     personal = cfg.get("personal", {})
     dash = personal.get("dashboard_url", "")
@@ -1603,6 +1603,14 @@ BROWSER_DOWN = re.compile(r"playwright|9222|initializeServer|timeout de iniciali
                          r"navegador (de playwright )?no (inicia|inicializa|responde)", re.I)
 
 
+def tanda_active() -> bool:
+    """La tanda de captchas está corriendo (latido de tanda.py de menos de 3 minutos)."""
+    try:
+        return time.time() - (radar.ROOT / "data" / "tanda.on").stat().st_mtime < 180
+    except OSError:
+        return False
+
+
 def heal_browser() -> bool:
     """The shared Chrome (CDP 9222) hung: restart it if it does not answer. Its profile keeps every session."""
     import urllib.request
@@ -1611,6 +1619,9 @@ def heal_browser() -> bool:
         return True
     except OSError:
         pass
+    if tanda_active():
+        debug_log(None, "el Chrome del agente no responde, pero hay tanda: no lo reinicio")
+        return False
     debug_log(None, "el Chrome del agente no responde: lo reinicio")
     subprocess.run(["systemctl", "--user", "restart", "chrome.service"], capture_output=True, timeout=90)
     time.sleep(10)
@@ -2871,7 +2882,12 @@ def run(force_collect: bool = False) -> dict:
                   "guiones de video": "Escribiendo guiones para los videos que piden", "postulaciones": "Postulando", "empresas top": "Empresas top: borradores investigados",
                   "recordatorios": "Enviando seguimientos",
                   "terminar a mano": "Dejándote lista una postulación que necesita un paso tuyo"}
+        tanda_on = tanda_active()
+        if tanda_on:
+            report["tanda"] = "activa: sin formularios ni ordenar la pantalla en este ciclo"
         for name, step in steps:
+            if tanda_on and name in ("linkedin", "postulaciones", "empresas top", "terminar a mano"):
+                continue  # 2026-11-20: Jero está en una tanda de captchas en este Chrome
             progress(labels[name])
             try:
                 step(service, cfg, report)
