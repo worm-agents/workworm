@@ -32,6 +32,7 @@ HEARTBEAT = radar.ROOT / "data" / "tanda.on"
 STOP = radar.ROOT / "data" / "tanda.stop"
 AHEAD = 3               # formularios listos (o esperando la verificación) por delante de Jero (Jero 20/11: «me abrió solo 3»)
 IDLE_MINUTES = 30       # sin ninguna acción de Jero, la tanda se pausa sola
+FRESH_MINUTES = 15      # un formulario listo hace más que esto se revisa en su pestaña (las sesiones de los sitios vencen)
 VIDEO = re.compile(r"\bvideo|loom|spark ?hire|hirevue|grab(á|a)r", re.I)
 # Solo las señales claras de que la verificación está ANTES del formulario. Lo demás arranca en modo submit y, si el
 # agente choca con una verificación antes de llegar al formulario, pasa solo a modo start (ver _fill).
@@ -371,6 +372,17 @@ def worker() -> None:
         if not todo and len(waiting) < AHEAD:
             todo = next((r for r in items if r["state"] == "queued"), None)
         if not todo:
+            # Mientras espera a Jero, mantiene frescos los listos: los formularios vencen (Humana «No Activity», Paycom
+            # vuelve a «Start Application», Lever rechaza «error verifying your application»). Jero 20/11.
+            stale = [r for r in items if r["state"] == "ready" and r["tabs"] not in ("", "[]")
+                     and radar.parse_time(r["updated_at"])
+                     and (datetime.now(timezone.utc) - radar.parse_time(r["updated_at"])).total_seconds() > FRESH_MINUTES * 60]
+            if stale:
+                _fill({**stale[0], "state": "checked",
+                       "instruction": (stale[0].get("instruction") or "") + " Este formulario ya estaba cargado hace un rato: "
+                       "revisá que siga todo (CV adjunto, cada campo); si la sesión venció o la página se vació, tocá "
+                       "Continue o recargá y volvé a llenarlo."}, cfg)
+                continue
             time.sleep(5)
             continue
         if todo["state"] == "queued" and todo["mode"] == "start":
