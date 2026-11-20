@@ -309,7 +309,8 @@ def alert_action(cfg: dict, company: str, title: str, what: str, link: str = "",
         notify(None, cfg, f"Te toca: {company}" + (f" · {deadline}" if deadline else ""), chr(10).join(lines))
     except Exception as exc:
         debug_log(None, f"aviso urgente {company}: {exc}")
-    if TASKS_SCRIPT.exists() and TASKS_PYTHON.exists():
+    if radar.personal("google_tasks", False) and TASKS_SCRIPT.exists() and TASKS_PYTHON.exists():
+        # 2026-11-20: apagado por pedido de Jero (no quiere tareas); lo pendiente está en el tablero.
         due = (deadline or "")[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", deadline or "") else local_now().date().isoformat()
         notes = chr(10).join(x for x in (what, link, mail_link(thread_id) if thread_id else "") if x)
         try:
