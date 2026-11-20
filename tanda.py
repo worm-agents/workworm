@@ -30,7 +30,7 @@ import radar
 
 HEARTBEAT = radar.ROOT / "data" / "tanda.on"
 STOP = radar.ROOT / "data" / "tanda.stop"
-AHEAD = 2               # formularios listos (o esperando la verificación) por delante de Jero
+AHEAD = 3               # formularios listos (o esperando la verificación) por delante de Jero (Jero 20/11: «me abrió solo 3»)
 IDLE_MINUTES = 30       # sin ninguna acción de Jero, la tanda se pausa sola
 VIDEO = re.compile(r"\bvideo|loom|spark ?hire|hirevue|grab(á|a)r", re.I)
 # Solo las señales claras de que la verificación está ANTES del formulario. Lo demás arranca en modo submit y, si el
@@ -153,6 +153,16 @@ def show(job_id: int) -> None:
             continue
 
 
+def tab_info(tabs_json: str) -> str:
+    """«sitio · título» de la primera pestaña abierta del formulario, para que Jero sepa cuál es."""
+    ids = json.loads(tabs_json or "[]")
+    for t in agent.vm_tabs():
+        if t["id"] in ids:
+            host = radar.urlparse(t["url"]).netloc.replace("www.", "")
+            return f"{host} · {t['title'][:60]}"
+    return ""
+
+
 def _close_tabs(job_id: int) -> None:
     for tab in json.loads(next((r["tabs"] for r in rows() if r["job_id"] == job_id), "[]") or "[]"):
         try:
@@ -210,6 +220,7 @@ def _open_for_check(job: dict) -> list[str]:
 
 def _fill(job: dict, cfg: dict) -> None:
     _set(job["job_id"], state="filling", detail="El agente está llenando el formulario")
+    before = set(agent.open_tab_ids())
     try:
         result = agent.assist_form(job["job_id"], cfg, url=job.get("url") or "", instruction=job.get("instruction") or "")
     except Exception as exc:  # el worker no se cae por un formulario
@@ -226,7 +237,9 @@ def _fill(job: dict, cfg: dict) -> None:
         # Había una verificación antes del formulario: que la pase Jero y después se llena.
         _set(job["job_id"], mode="start", state="queued", detail="Tiene verificación al abrir: pasa a modo «Listo»")
     else:
-        _set(job["job_id"], state="failed", detail=result.get("detail", "")[:1500])
+        # Aunque no quedó del todo listo, la pestaña sigue abierta: Jero puede terminarlo y marcarlo «Enviado».
+        tabs = [t for t in agent.open_tab_ids() if t not in before]
+        _set(job["job_id"], state="failed", tabs=json.dumps(tabs), detail=result.get("detail", "")[:1500])
         with agent.connect() as db:
             agent.log_event(db, job["job_id"], "tanda_failed", "El agente no lo pudo dejar listo: " + result.get("detail", "")[:400])
 
