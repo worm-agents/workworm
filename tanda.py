@@ -145,12 +145,14 @@ def stop() -> None:
 def show(job_id: int) -> None:
     """Trae al frente la pestaña de ese formulario (lo pidió Jero desde el tablero)."""
     touch()
-    for tab in json.loads(next((r["tabs"] for r in rows() if r["job_id"] == job_id), "[]") or "[]"):
+    tabs = json.loads(next((r["tabs"] for r in rows() if r["job_id"] == job_id), "[]") or "[]")
+    for tab in tabs:
         try:
             agent._cdp(f"/json/activate/{tab}")
-            return
+            break
         except (OSError, ValueError):
             continue
+    scroll_to_captcha(tabs)
 
 
 def tab_info(tabs_json: str) -> str:
@@ -218,30 +220,135 @@ def _open_for_check(job: dict) -> list[str]:
     return [t for t in agent.open_tab_ids() if t not in before]
 
 
-def _fill(job: dict, cfg: dict) -> None:
-    _set(job["job_id"], state="filling", detail="El agente está llenando el formulario")
-    before = set(agent.open_tab_ids())
+FILL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "outcome": {"type": "string", "enum": ["sent", "ready", "verification", "failed"]},
+        "detail": {"type": "string"},
+    },
+    "required": ["outcome", "detail"],
+}
+
+SCROLL_JS = """() => {
+  const sel = ['iframe[src*="hcaptcha"]', 'iframe[src*="recaptcha"]', 'iframe[src*="turnstile"]', 'iframe[title*="captcha" i]',
+               '.h-captcha', '.g-recaptcha', '.cf-turnstile', 'button[type=submit]', 'input[type=submit]'];
+  for (const s of sel) { const e = document.querySelector(s); if (e) { e.scrollIntoView({block: 'center'}); return s; } }
+  return '';
+}"""
+
+
+def scroll_to_captcha(tab_ids: list[str]) -> str:
+    """Deja la pestaña con el captcha (o el botón de enviar) en el medio de la pantalla. Jero 20/11: «no me dejó
+    scrolleado en el captcha»."""
+    from playwright.sync_api import sync_playwright
     try:
-        result = agent.assist_form(job["job_id"], cfg, url=job.get("url") or "", instruction=job.get("instruction") or "")
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{agent.ASSIST_PORT}", timeout=15000)
+            for ctx in browser.contexts:
+                for page in ctx.pages:
+                    session = ctx.new_cdp_session(page)
+                    target = session.send("Target.getTargetInfo")["targetInfo"]["targetId"]
+                    session.detach()
+                    if target in tab_ids:
+                        return page.evaluate(SCROLL_JS) or ""
+    except Exception as exc:  # nunca frena la tanda
+        return f"error: {exc}"
+    return ""
+
+
+def _tab_url(tab_ids: list[str]) -> tuple[str, str]:
+    for t in agent.vm_tabs():
+        if t["id"] in tab_ids:
+            return t["url"], t["title"]
+    return "", ""
+
+
+def _fill(job: dict, cfg: dict) -> None:
+    """Llena (o sigue llenando) el formulario. A diferencia de assist_form:
+    - si en el último paso no hay captcha ni verificación, ENVÍA el agente (Jero 20/11: «por qué me lo pidió, si pudo
+      haberlo hecho él», Indeed Smart Apply);
+    - si aparece un captcha a mitad del formulario (JPMorgan, email → Next), frena con outcome=verification y, cuando Jero lo
+      resuelve y toca «Listo», sigue EN ESA MISMA PESTAÑA;
+    - usa autopilot.tanda_model (sonnet por defecto): con haiku quedaban campos y casillas vacías (JPMorgan, AirTM, Humana)."""
+    job_id = job["job_id"]
+    _set(job_id, state="filling", detail="El agente está llenando el formulario")
+    info = radar.job(job_id)
+    with agent.connect() as db:
+        app_row = db.execute("SELECT body, cv_path FROM applications WHERE job_id=?", (job_id,)).fetchone()
+    letter = (app_row["body"] if app_row else "").split("\n\nRespuestas del formulario:")[0]
+    language = agent.application_language(info, cfg, "")
+    cv = agent.cv_for(cfg, language)
+    cv_path = app_row["cv_path"] if app_row and app_row["cv_path"] and agent.Path(app_row["cv_path"]).exists() \
+        else str(agent.upload_copy(cv))
+    old_tabs = json.loads(job.get("tabs") or "[]")
+    tab_url, tab_title = _tab_url(old_tabs) if job["state"] == "checked" else ("", "")
+    where = (f"YA HAY UNA PESTAÑA ABIERTA con esta postulación (URL: {tab_url} · título: {tab_title}). Seleccionala con "
+             "browser_tabs y SEGUÍ DESDE DONDE ESTÁ: el candidato acaba de resolver ahí una verificación o un captcha. "
+             "No abras otra pestaña ni vuelvas a empezar.\n" if tab_url else
+             f"Abrí {job.get('url') or info['url']} en una PESTAÑA NUEVA (no toques ni cierres las otras) y pulsá "
+             "«Apply/Postularme»; si te lleva a la web de la empresa, seguí ahí.\n")
+    prompt = (
+        f"Postulá a esta oferta en nombre de {cfg['candidate_name']} usando el navegador.\n"
+        f"Oferta: {info['title']} — {info['company']}\nCV para subir (ruta absoluta): {cv_path}\n" + where +
+        (f"Es un formulario que mandó el reclutador por mail: {job['instruction']}\n" if job.get("instruction") else "") +
+        f"Carta de presentación:\n{letter}\n\nTexto del CV:\n{agent.cv_texts(cfg).get(cv['id'], '')}\n\n"
+        "Completá TODOS los campos y pasos: obligatorios y opcionales, listas, radios, casillas de consentimiento de la "
+        "postulación (privacidad, términos, avisos por SMS o mail sobre esta postulación: marcalas, el candidato las acepta), "
+        "ubicación actual, pretensión, preguntas de selección. En los campos con autocompletar (ubicación, ciudad, "
+        "universidad) elegí una opción de la lista, no dejes solo el texto escrito. Antes de terminar, sacá un "
+        "browser_snapshot y recorré el formulario de arriba abajo: si queda algún campo vacío o un mensaje de error en "
+        "rojo, corregilo.\n\n"
+        "Al llegar al último paso, con todo cargado:\n"
+        "- Si NO hay captcha ni verificación humana a la vista, ENVIÁ vos (pulsá el botón final UNA vez), confirmá que "
+        "aparezca el mensaje de envío exitoso y devolvé outcome=sent.\n"
+        "- Si hay un captcha o verificación (hCaptcha, reCAPTCHA, Cloudflare, «no soy un robot»), NO lo resuelvas ni envíes: "
+        "scrolleá hasta que el captcha y el botón de enviar queden en el medio de la pantalla y devolvé outcome=ready.\n"
+        "- Si un captcha o verificación aparece ANTES de terminar (al abrir, en el primer paso, al tocar Next), frená ahí "
+        "sin resolverlo, dejá esa pestaña en ese punto y devolvé outcome=verification.\n"
+        "- Si no se puede (el aviso cerró, pide crear una cuenta con contraseña, falta un dato que el perfil no tiene), "
+        "devolvé outcome=failed y decí por qué.\n"
+        "No cierres el navegador ni la pestaña del formulario. En detail: qué quedó cargado y qué falta, corto."
+        + agent.FORM_FACTS + agent.personal_form_rules())
+    before = set(agent.open_tab_ids())
+    config = radar.ROOT / "data" / "mcp_assist.json"
+    config.write_text(json.dumps({"mcpServers": {"playwright": {"command": "npx", "args": [
+        "-y", agent.PLAYWRIGHT_MCP, "--cdp-endpoint", f"http://127.0.0.1:{agent.ASSIST_PORT}",
+        "--allow-unrestricted-file-access", "--output-dir", str(radar.ROOT / "data" / "pw-output")]}}}), encoding="utf-8")
+    try:
+        result = agent.llm.ask(agent.system_prompt(cfg), prompt, FILL_SCHEMA,
+                               model=cfg["autopilot"].get("tanda_model", "sonnet"),
+                               timeout=int(cfg["autopilot"].get("form_timeout_minutes", 15)) * 60,
+                               extra=["--mcp-config", str(config), "--strict-mcp-config", "--allowedTools", "mcp__playwright",
+                                      "--disallowedTools", "mcp__playwright__browser_close"])
     except Exception as exc:  # el worker no se cae por un formulario
-        result = {"ready": False, "detail": f"{type(exc).__name__}: {exc}"}
-    if job.get("tabs") and job["state"] == "checked":
-        _close_tabs(job["job_id"])  # la pestaña de la verificación ya no hace falta
-    if result.get("ready"):
-        holds = [h for h in agent.active_holds() if h["job_id"] == job["job_id"]]
-        tabs = holds[0]["tabs"] if holds else []
-        _set(job["job_id"], state="ready", tabs=json.dumps(tabs), detail=result["detail"][:1500])
+        result = {"outcome": "failed", "detail": f"{type(exc).__name__}: {exc}"}
+    tabs = [t for t in agent.open_tab_ids() if t not in before] or [t for t in old_tabs if t in agent.open_tab_ids()]
+    outcome, detail = result["outcome"], result.get("detail", "")[:1500]
+    if outcome == "sent":
         with agent.connect() as db:
-            agent.log_event(db, job["job_id"], "tanda_ready", result["detail"][:500])
-    elif BLOCKED_BEFORE_FORM.search(result.get("detail", "")) and job["mode"] != "start":
-        # Había una verificación antes del formulario: que la pase Jero y después se llena.
-        _set(job["job_id"], mode="start", state="queued", detail="Tiene verificación al abrir: pasa a modo «Listo»")
+            db.execute("UPDATE applications SET status='sent', channel='form', sent_at=?, last_outbound_at=?, updated_at=? "
+                       "WHERE job_id=?", (now(), now(), now(), job_id))
+            db.execute("UPDATE jobs SET status='applied', updated_at=? WHERE id=?", (now(), job_id))
+            agent.log_event(db, job_id, "applied", "Formulario enviado por el agente en la tanda (no había captcha)")
+        agent.clear_hold(job_id)
+        _set(job_id, state="sent", tabs=json.dumps(tabs), detail="Lo envió el agente (no había captcha). " + detail)
+        _close_tabs(job_id)
+    elif outcome == "ready":
+        agent.set_hold(job_id, int(cfg["autopilot"].get("hold_minutes", 180)), tabs=tabs)
+        scroll_to_captcha(tabs)
+        _set(job_id, state="ready", tabs=json.dumps(tabs), detail=detail)
+        with agent.connect() as db:
+            agent.log_event(db, job_id, "tanda_ready", detail[:500])
+    elif outcome == "verification":
+        agent.set_hold(job_id, int(cfg["autopilot"].get("hold_minutes", 180)), tabs=tabs)
+        scroll_to_captcha(tabs)
+        _set(job_id, mode="start", state="opening", tabs=json.dumps(tabs),
+             detail="Apareció una verificación en el medio: resolvela en esa pestaña y tocá «Listo»; el agente sigue ahí. "
+                    + detail)
     else:
-        # Aunque no quedó del todo listo, la pestaña sigue abierta: Jero puede terminarlo y marcarlo «Enviado».
-        tabs = [t for t in agent.open_tab_ids() if t not in before]
-        _set(job["job_id"], state="failed", tabs=json.dumps(tabs), detail=result.get("detail", "")[:1500])
+        _set(job_id, state="failed", tabs=json.dumps(tabs), detail=detail)
         with agent.connect() as db:
-            agent.log_event(db, job["job_id"], "tanda_failed", "El agente no lo pudo dejar listo: " + result.get("detail", "")[:400])
+            agent.log_event(db, job_id, "tanda_failed", "El agente no lo pudo dejar listo: " + detail[:400])
 
 
 def idle() -> bool:
