@@ -1292,6 +1292,42 @@ LOGIN_PAGES = ("https://secure.indeed.com/auth", "https://www.getonbrd.com/login
                "https://candidato.ar.computrabajo.com/acceso/", "https://www.bumeran.com.ar/login")
 
 
+
+# Login automático de las bolsas donde Jero ya tiene cuenta (Sync/login/login.py del vault, entra con la cuenta de
+# Google o LinkedIn del Chrome compartido; nunca crea cuentas ni escribe contraseñas). Las cuentas por empresa
+# (Workday, UKG, SuccessFactors...) no van acá: esas piden crear una cuenta, no volver a entrar.
+AUTO_LOGIN = {"getonbrd.com": "getonbrd", "zonajobs.com.ar": "zonajobs", "bumeran.com.ar": "bumeran",
+              "indeed.com": "indeed", "computrabajo.com": "computrabajo"}
+LOGIN_PY = Path.home() / "Vault" / "Sync" / "login" / "login.py"
+LOGIN_PYTHON = Path.home() / ".venv-xpost" / "bin" / "python"
+
+
+def auto_login_site(*sites: str) -> str | None:
+    """Adapter name in login.py for the first site (domain, URL host or adapter name) that has one."""
+    for site in sites:
+        host = (site or "").lower().strip()
+        if host in AUTO_LOGIN.values():
+            return host
+        host = radar.urlparse(host).netloc or host if "://" in host else host
+        host = host.split("/")[0].replace("www.", "")
+        for domain, name in AUTO_LOGIN.items():
+            if host == domain or host.endswith("." + domain):
+                return name
+    return None
+
+
+def auto_login(*sites: str) -> bool:
+    """Sign in again by itself (login.py) on a job board that dropped the session. True if the session is alive."""
+    name = auto_login_site(*sites)
+    if not name or IS_WINDOWS or not LOGIN_PY.exists():
+        return False
+    try:
+        r = subprocess.run([str(LOGIN_PYTHON), "-I", str(LOGIN_PY), name], capture_output=True, text=True, timeout=420)
+    except subprocess.TimeoutExpired:
+        return False
+    return r.returncode == 0
+
+
 def open_agent_edge(urls: tuple[str, ...] = LOGIN_PAGES) -> None:
     """Open the agent's Edge profile so the user can sign in once (Indeed, Get on Board...)."""
     launch_agent_browser(*urls)
@@ -2185,6 +2221,10 @@ def auto_apply(service, cfg: dict, report: dict) -> None:
         report["daily_cap_reached"] = True
         return
     no_login: set[str] = set()
+    relogged: set[str] = set()
+    # antes de gastar intentos del agente: que las bolsas de la cola tengan sesión (si está viva es solo una carga)
+    for name in sorted({auto_login_site(r["url"]) for r in rows if not r["contact_email"]} - {None}):
+        auto_login(name)
     last_mail_check, llm_failures, browser_fails = time.time(), 0, 0
     deadline = time.time() + 60 * int(pilot.get("apply_minutes_per_cycle", 40))
     for done, row in enumerate(rows):
@@ -2226,6 +2266,17 @@ def auto_apply(service, cfg: dict, report: dict) -> None:
                 break
             continue
         browser_fails = 0
+        if status.startswith("login_required") and domain not in relogged                 and auto_login_site(status.split(":", 1)[1], row["url"]):
+            relogged.add(domain)  # una vez por bolsa y por ciclo
+            if auto_login(status.split(":", 1)[1], row["url"]):
+                with connect() as db:
+                    db.execute("UPDATE events SET kind='login_required_done' WHERE job_id=? AND kind='login_required'",
+                               (row["id"],))
+                try:
+                    status = apply(service, radar.job(row["id"]), cfg)
+                except llm.LLMError as exc:
+                    report["errors"].append(f"LLM al reintentar {row['company']} después del login: {exc}")
+                    continue
         if status.startswith("login_required"):
             no_login.add(domain)
             report.setdefault("login_required", []).append(status.split(":", 1)[1] or domain)
@@ -2240,8 +2291,10 @@ def auto_apply(service, cfg: dict, report: dict) -> None:
                                  ((datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),)).fetchone()["n"]
             log_event(db, None, "login_notice", ", ".join(sites))
         if not already:
-            notify(service, cfg, "Iniciá sesión en el Edge del agente",
-                   "No pude postular porque estos sitios piden sesión: " + ", ".join(sites) +
+            notify(service, cfg, "Iniciá sesión en el Chrome de la VM",
+                   "No pude postular porque estos sitios piden sesión y el login automático no pudo (o el sitio pide "
+                   "crear una cuenta): " + ", ".join(sites) +
+                   "\n\nDetalle del login automático: ~/.pendant-runtime/rutinas/login/login.log" +
                    "\n\nEn el tablero: Configuración → «Abrir Edge del agente», iniciá sesión y cerrá la ventana.")
 
 
