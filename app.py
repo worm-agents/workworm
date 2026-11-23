@@ -440,6 +440,15 @@ with board:
                    "si era un formulario, la oferta vuelve a la cola y se postula en la próxima revisión; "
                    "si era un mensaje de un reclutador, el agente le responde con lo que escribas.")
         account_jobs = [j for j in attention_jobs if agent.attention_kind(j) == "account"]
+        to_create = [j for j in account_jobs if not agent.auto_login_site(j.get("login_url") or "", j["url"])
+                     and not agent.account_creating(j["id"])]
+        if len(to_create) > 1:
+            if st.button(f"Sí, creá todas las cuentas ({len(to_create)}: "
+                         + ", ".join(j["company"] or "?" for j in to_create[:6]) + ("…" if len(to_create) > 6 else "")
+                         + ")", type="primary", width="stretch"):
+                agent.approve_accounts([j["id"] for j in to_create])
+                st.toast("Creando las cuentas de a una en el Chrome de la VM; te llega el resultado en el mail")
+                st.rerun()
         if len(account_jobs) > 1:
             b1, b2 = st.columns(2)
             if b1.button(f"Abrir todos los logins ({len({radar.urlparse(j.get('login_url') or j['url']).netloc for j in account_jobs})} sitios)",
@@ -498,9 +507,17 @@ with board:
                 else:
                     box.caption("Abrí la oferta, tocá «Postularme» → «Continuar con Google» (o creá la cuenta), cerrá la "
                                 "ventana y «Listo, reintentar».")
+                creating = agent.account_creating(j["id"])
+                if creating:
+                    box.info("Creando la cuenta (lo aprobaste). Tarda unos minutos; el resultado llega en el mail.")
+                elif not agent.auto_login_site(j.get("login_url") or "", j["url"]):
+                    if box.button(f"Sí, creá la cuenta (con {cfg['candidate_email']}, contraseña cifrada en el servidor)",
+                                  key=f"acc-create-{j['id']}", type="primary", width="stretch"):
+                        agent.approve_accounts([j["id"]])
+                        st.rerun()
                 a1, a2, a3 = box.columns(3)
                 if a1.button("Abrir login en el Chrome de la VM" if j.get("login_url") else "Abrir en el Chrome de la VM",
-                             key=f"acc-open-{j['id']}", type="primary", width="stretch"):
+                             key=f"acc-open-{j['id']}", width="stretch"):
                     agent.open_login_pages([j["id"]])
                 if a2.button("Listo, reintentar", key=f"acc-retry-{j['id']}", width="stretch"):
                     agent.retry_after_account(j["id"])
