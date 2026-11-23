@@ -1302,18 +1302,63 @@ LOGIN_PY = Path.home() / "Vault" / "Sync" / "login" / "login.py"
 LOGIN_PYTHON = Path.home() / ".venv-xpost" / "bin" / "python"
 
 
+ATS_STORE = Path.home() / ".config" / "rutinas-login"
+
+
+SHARED_AUTH = re.compile(r"^signin[-.]|\.auth0\.com$|^login\.microsoftonline|^accounts\.google|^auth\.|^sso\.", re.I)
+
+
+def stable_login(*urls: str) -> str:
+    """Primera URL que no es un login central con un `state` que vence (para volver a entrar más adelante)."""
+    return next((u for u in urls if u and u.startswith("http") and account_key(u)), "")
+
+
+def account_key(url: str) -> str:
+    """Nombre login.py (ats_<clave>) de la cuenta por empresa que pide `url`. Cada portal guarda una cuenta por
+    empresa, y algunos comparten host entre empresas: UKG (recruiting.ultipro.com/<EMPRESA>/...) y SuccessFactors
+    (?company=<empresa>) llevan la empresa en la ruta o en la query; Workday y el resto, en el host."""
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "https://" + url
+    parts = radar.urlparse(url)
+    host = parts.netloc.lower().split(":")[0].removeprefix("www.")
+    if not host or SHARED_AUTH.search(host):
+        return ""  # login central de varios portales (UKG, Auth0...): la empresa sale de otra URL
+    path = [p for p in parts.path.split("/") if p]
+    tenant = ""
+    if host == "recruiting.ultipro.com" and path:
+        tenant = path[0]
+    elif "successfactors" in host:
+        from urllib.parse import parse_qs
+        tenant = (parse_qs(parts.query).get("company") or [""])[0]
+    elif host.endswith(".myworkdayjobs.com") or host.endswith(".myworkday.com"):
+        host = host.split(".myworkday")[0]  # proofpoint.wd5 -> la cuenta es de ese tenant
+    key = re.sub(r"[^a-z0-9]+", "_", f"{host}_{tenant}".lower()).strip("_")
+    return "ats_" + key[:80] if key else ""
+
+
+def ats_account(*urls: str) -> str | None:
+    """ats_<clave> de la primera URL que ya tiene una cuenta creada por WorkWorm (credencial cifrada en el servidor)."""
+    for url in urls:
+        key = account_key(url or "")
+        if key and (ATS_STORE / f"{key}.json").exists():
+            return key
+    return None
+
+
 def auto_login_site(*sites: str) -> str | None:
     """Adapter name in login.py for the first site (domain, URL host or adapter name) that has one."""
     for site in sites:
         host = (site or "").lower().strip()
-        if host in AUTO_LOGIN.values():
+        if host in AUTO_LOGIN.values() or host.startswith("ats_"):
             return host
         host = radar.urlparse(host).netloc or host if "://" in host else host
         host = host.split("/")[0].replace("www.", "")
         for domain, name in AUTO_LOGIN.items():
             if host == domain or host.endswith("." + domain):
                 return name
-    return None
+    return ats_account(*sites)
 
 
 def auto_login(*sites: str) -> bool:
@@ -1597,6 +1642,8 @@ def apply_form(service, job: dict, cfg: dict, decision: dict, cv: dict, dry_run:
                    (result["reason"], now(), job["id"]))
         if status == "login_required":
             log_event(db, job["id"], "login_required", f"{result['site']}: {result['reason']}")
+            if (result.get("login_url") or "").startswith("http"):
+                db.execute("UPDATE applications SET login_url=? WHERE job_id=?", (result["login_url"], job["id"]))
     if status == "login_required":
         with connect() as db:
             tries = db.execute("SELECT COUNT(*) n FROM events WHERE job_id=? AND kind='login_required'",
@@ -1707,13 +1754,210 @@ def needs_account(service, job: dict, cfg: dict, site: str, reason: str, result:
         db.execute("UPDATE applications SET login_url=?, login_google=?, updated_at=? WHERE job_id=?",
                    (login_url if login_url.startswith("http") else "", int(bool(result.get("login_google"))),
                     now(), job["id"]))
+        relogins = db.execute("SELECT COUNT(*) n FROM events WHERE job_id=? AND kind='ats_relogin'",
+                              (job["id"],)).fetchone()["n"]
+    known = ats_account(login_url, site, job["url"])
+    if known and relogins < 2:  # la cuenta ya existe (la creó WorkWorm): entra solo y la oferta vuelve a la cola
+        ok = auto_login(known)
+        with connect() as db:
+            log_event(db, job["id"], "ats_relogin", f"{known}: {'OK' if ok else 'no pudo entrar'}")
+        if ok:
+            retry_after_account(job["id"])
+            return "requeued"
     radar.set_status(job["id"], "action_needed",
                      f"CUENTA: {site or radar.urlparse(job['url']).netloc} pide crear cuenta o iniciar sesión. {reason}")
-    notify(service, cfg, f"Creá la cuenta para postular a {job['company']}",
+    notify(service, cfg, f"¿Creo la cuenta para postular a {job['company']}?",
            f"{job['title']} en {job['company']}\n{job['url']}\n\n{reason}\n\n"
-           f"Ya te dejé la pestaña abierta en la pantalla del agente: creá la cuenta con {cfg['candidate_email']} "
-           "(o entrá con Google) y tocá «Listo, reintentar» en el tablero.")
+           f"Si querés, la creo yo con {cfg['candidate_email']}: tocá «Sí, creá la cuenta» en el tablero (Requieren tu "
+           "atención). La contraseña la genera y la guarda cifrada el servidor; después postulo solo.")
     return "action_needed"
+
+
+# --- Alta de cuentas por empresa (Jero, 2026-11-23): solo con su sí, una por una, desde el tablero -------------------
+# El agente (modelo) completa el registro SIN la contraseña y deja la pestaña lista; login.py crear (script fijo, sin
+# modelo) genera la contraseña, la guarda cifrada, la escribe, envía y abre el link de verificación del mail.
+ACCOUNT_LOCK = radar.ROOT / "data" / "accounts.lock"
+SIGNUP_FILL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["ready", "exists", "captcha", "google_only", "needs_human",
+                                               "no_account_needed"]},
+        "signup_url": {"type": "string", "description": "URL exacta de la pestaña donde quedó el registro completo"},
+        "login_url": {"type": "string", "description": "URL de la página de inicio de sesión de ese portal"},
+        "submit_label": {"type": "string", "description": "Texto exacto del botón que envía el registro"},
+        "reason": {"type": "string", "description": "Una o dos oraciones en español"},
+    },
+    "required": ["status", "signup_url", "login_url", "submit_label", "reason"],
+}
+
+
+def approve_accounts(job_ids: list[int]) -> None:
+    """Jero tocó «Sí, creá la cuenta»: queda registrado su sí para ESA oferta y arranca el alta en segundo plano."""
+    import sys
+    with connect() as db:
+        for job_id in job_ids:
+            log_event(db, job_id, "account_approved", "sí de Jero en el tablero")
+            db.execute("UPDATE applications SET note=?, updated_at=? WHERE job_id=?",
+                       ("CUENTA: creando la cuenta (lo aprobaste en el tablero)…", now(), job_id))
+    subprocess.Popen([sys.executable, "-c", "import agent; agent.create_pending_accounts()"], cwd=str(radar.ROOT),
+                     start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def accounts_pending() -> list[int]:
+    """Ofertas con el sí de Jero y sin intento de alta después de ese sí."""
+    with connect() as db:
+        return [r["job_id"] for r in db.execute(
+            """SELECT a.job_id, MAX(a.at) approved FROM events a JOIN jobs j ON j.id=a.job_id
+               WHERE a.kind='account_approved' AND j.status='action_needed' GROUP BY a.job_id
+               HAVING NOT EXISTS (SELECT 1 FROM events t WHERE t.job_id=a.job_id AND t.kind='account_attempt'
+                                  AND t.at >= approved)""")]
+
+
+def account_creating(job_id: int) -> bool:
+    return job_id in accounts_pending()
+
+
+def create_pending_accounts() -> None:
+    """Corre de a una las altas aprobadas. Si ya hay otro proceso creando, ese toma las nuevas al terminar."""
+    import fcntl
+    ACCOUNT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(ACCOUNT_LOCK, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        cfg = radar.config()
+        while True:
+            pending = accounts_pending()
+            if not pending:
+                return
+            try:
+                create_account(pending[0], cfg)
+            except Exception as exc:  # nunca dejar la oferta trabada en «creando»
+                with connect() as db:
+                    log_event(db, pending[0], "account_attempt", f"error: {exc}"[:300])
+                _account_failed(pending[0], f"error interno al crear la cuenta: {exc}"[:300])
+
+
+def _account_failed(job_id: int, why: str) -> None:
+    job = radar.job(job_id)
+    radar.set_status(job_id, "action_needed", f"CUENTA: no pude crear la cuenta sola: {why}")
+    notify(None, radar.config(), f"No pude crear la cuenta para {job['company']}",
+           f"{job['title']} en {job['company']}\n{job.get('login_url') or job['url']}\n\n{why}\n\n"
+           "Podés crearla vos en la pantalla del agente y tocar «Listo, reintentar», o descartar la oferta.")
+
+
+def create_account(job_id: int, cfg: dict, dry_run: bool = False):
+    """Alta de la cuenta que pide una oferta. Exige el sí de Jero registrado para esa oferta (account_approved).
+    dry_run: ensayo sin sí ni registro en la base; el agente deja el formulario completo SIN enviar y devuelve lo que
+    vio (nunca se llama a login.py crear)."""
+    job = radar.job(job_id)
+    if dry_run:
+        return _signup_fill(job, cfg)
+    with connect() as db:
+        approved = db.execute("SELECT MAX(at) at FROM events WHERE job_id=? AND kind='account_approved'",
+                              (job_id,)).fetchone()["at"]
+        if not approved:
+            return "sin_aprobacion"  # nunca se crea una cuenta sin el sí de Jero para esta oferta
+        log_event(db, job_id, "account_attempt", "arranca el alta")
+    known = ats_account(job.get("login_url") or "", job["url"])
+    if known:  # ya existe (otra oferta de la misma empresa): solo entrar
+        if auto_login(known):
+            retry_after_account(job_id)
+            return "requeued"
+        _account_failed(job_id, f"ya hay una cuenta guardada ({known}) pero no pude entrar")
+        return "failed"
+    try:
+        result = _signup_fill(job, cfg)
+    except llm.LLMError as exc:
+        _account_failed(job_id, f"el agente no terminó de preparar el registro ({exc})")
+        return "failed"
+    return _finish_account(job_id, job, cfg, result)
+
+
+def _signup_fill(job: dict, cfg: dict) -> dict:
+    """El agente completa el registro sin contraseña y sin enviar. Devuelve SIGNUP_FILL_SCHEMA."""
+    ensure_browser()
+    start = job.get("login_url") or job["url"]
+    prompt = (
+        f"Tenés que dejar listo el REGISTRO (crear cuenta) del portal de empleo que pide esta oferta, para "
+        f"{cfg['candidate_name']}. Jero ya aprobó crear esta cuenta.\n\n"
+        f"Oferta: {job['title']} — {job['company']}\nURL de la oferta: {job['url']}\nPágina de login/registro "
+        f"conocida: {start}\nMail de la cuenta: {cfg['candidate_email']}\n\n"
+        "Pasos:\n"
+        "1. Abrí una PESTAÑA NUEVA, andá a la oferta o a la página de login y llegá a la pantalla de CREAR CUENTA / "
+        "REGISTRARSE / SIGN UP / CREATE ACCOUNT del portal.\n"
+        "2. Elegí el registro con mail y contraseña (no con Google, LinkedIn ni otra red). Si el portal SOLO ofrece "
+        "registrarse con Google, devolvé google_only.\n"
+        "3. Completá TODOS los campos del registro con los datos del perfil: mail, nombre, apellido, teléfono, país, "
+        "DNI si lo pide, etc.\n"
+        "4. Casillas: marcá SOLO las obligatorias de términos, condiciones y política de privacidad estándar. Dejá SIN "
+        "marcar newsletters, marketing, «talent community», alertas por mail u otras opcionales. Si para registrarse "
+        "hay que aceptar algo que no sea estándar (declaraciones juradas, cesión de derechos, pagos, compromisos "
+        "fuera de lo común), devolvé needs_human sin marcarlo.\n"
+        "5. NUNCA escribas nada en los campos de contraseña ni de repetir contraseña: dejalos vacíos. Los completa "
+        "otro programa después.\n"
+        "6. NO toques el botón final que envía el registro. Dejá la pestaña abierta en ese formulario, con todo lo "
+        "demás cargado, y devolvé status=ready, la URL exacta de esa pestaña en signup_url, el texto EXACTO del botón "
+        "de enviar en submit_label y la URL de la página de inicio de sesión del portal en login_url.\n\n"
+        "Otros estados:\n"
+        "- exists: el portal dice que ya hay una cuenta con ese mail (no toques «olvidé mi contraseña»).\n"
+        "- captcha: hay un captcha o verificación humana.\n"
+        "- no_account_needed: en realidad se puede postular sin cuenta.\n"
+        "- needs_human: cualquier otra cosa que no puedas completar (decí cuál en reason).\n"
+        "No cierres pestañas ajenas ni el navegador." + personal_form_rules())
+    return llm.ask(system_prompt(cfg), prompt, SIGNUP_FILL_SCHEMA, model=cfg["autopilot"].get("model", "sonnet"),
+                   timeout=15 * 60, extra=["--mcp-config", str(mcp_config(cfg)), "--strict-mcp-config",
+                                           "--allowedTools", "mcp__playwright",
+                                           "--disallowedTools", "mcp__playwright__browser_close"])
+
+
+def _finish_account(job_id: int, job: dict, cfg: dict, result: dict) -> str:
+    status, reason = result["status"], result["reason"]
+    with connect() as db:
+        log_event(db, job_id, "account_attempt", f"{status}: {reason}"[:300])
+        if result["login_url"].startswith("http"):
+            db.execute("UPDATE applications SET login_url=? WHERE job_id=?", (result["login_url"], job_id))
+    if status == "no_account_needed":
+        retry_after_account(job_id)
+        return "requeued"
+    if status == "exists":
+        _account_failed(job_id, "el portal dice que ya tenés una cuenta con tu mail. No reseteo la contraseña sin "
+                                "tu sí: entrá vos o decime que la resetee.")
+        return "exists"
+    if status != "ready" or not result["signup_url"].startswith("http") or not result["submit_label"].strip():
+        _account_failed(job_id, reason)
+        return "failed"
+    key = next((k for k in (account_key(result["signup_url"]), account_key(result["login_url"]),
+                             account_key(job.get("login_url") or ""), account_key(job["url"])) if k), "")
+    login = stable_login(result["login_url"], result["signup_url"], job.get("login_url") or "", job["url"])
+    if not key or not login:
+        _account_failed(job_id, "no pude saber de qué empresa es el portal para guardar la cuenta")
+        return "failed"
+    words = [w for w in re.split(r"[^a-z0-9]+", normalize(job["company"] or "")) if len(w) >= 4][:3]
+    hints = words + [p for p in radar.urlparse(result["signup_url"]).netloc.split(".") if len(p) >= 4][:2]
+    try:
+        r = subprocess.run([str(LOGIN_PYTHON), "-I", str(LOGIN_PY), "crear", key, f"--url={result['signup_url']}",
+                            f"--boton={result['submit_label'].strip()}", f"--email={cfg['candidate_email']}",
+                            f"--login={login}", f"--pistas={','.join(hints)}"],
+                           capture_output=True, text=True, timeout=420)
+        line, code = (r.stdout.strip().splitlines() or [""])[-1], r.returncode
+    except subprocess.TimeoutExpired:
+        line, code = "se pasó de 7 minutos", 1
+    with connect() as db:
+        log_event(db, job_id, "account_created" if code == 0 else "account_failed", line[:300])
+    if code == 0:
+        retry_after_account(job_id)
+        notify(None, cfg, f"Cuenta creada para {job['company']}",
+               f"{job['title']} en {job['company']}\nCreé la cuenta en {radar.urlparse(login).netloc} con "
+               f"{cfg['candidate_email']} (contraseña cifrada en el servidor). La oferta volvió a la cola.")
+        return "created"
+    if code == 4:
+        _account_failed(job_id, "el portal dice que ya tenés una cuenta con tu mail. No reseteo la contraseña sin "
+                                "tu sí: entrá vos o decime que la resetee.")
+        return "exists"
+    _account_failed(job_id, line.split(":", 1)[-1].strip() or "login.py no pudo crear la cuenta")
+    return "failed"
 
 
 EXCLUSION_DEFAULTS = {
@@ -2266,9 +2510,11 @@ def auto_apply(service, cfg: dict, report: dict) -> None:
                 break
             continue
         browser_fails = 0
-        if status.startswith("login_required") and domain not in relogged                 and auto_login_site(status.split(":", 1)[1], row["url"]):
+        login_page = radar.job(row["id"]).get("login_url") or ""
+        if status.startswith("login_required") and domain not in relogged \
+                and auto_login_site(status.split(":", 1)[1], login_page, row["url"]):
             relogged.add(domain)  # una vez por bolsa y por ciclo
-            if auto_login(status.split(":", 1)[1], row["url"]):
+            if auto_login(status.split(":", 1)[1], login_page, row["url"]):
                 with connect() as db:
                     db.execute("UPDATE events SET kind='login_required_done' WHERE job_id=? AND kind='login_required'",
                                (row["id"],))
