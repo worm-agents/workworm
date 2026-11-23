@@ -1804,12 +1804,13 @@ def approve_accounts(job_ids: list[int]) -> None:
 
 
 def accounts_pending() -> list[int]:
-    """Ofertas con el sí de Jero y sin intento de alta después de ese sí."""
+    """Ofertas con el sí de Jero cuya alta no terminó (sin account_done después de ese sí). Mientras tanto el tablero
+    muestra «Creando la cuenta» y no vuelve a ofrecer el botón."""
     with connect() as db:
         return [r["job_id"] for r in db.execute(
             """SELECT a.job_id, MAX(a.at) approved FROM events a JOIN jobs j ON j.id=a.job_id
                WHERE a.kind='account_approved' AND j.status='action_needed' GROUP BY a.job_id
-               HAVING NOT EXISTS (SELECT 1 FROM events t WHERE t.job_id=a.job_id AND t.kind='account_attempt'
+               HAVING NOT EXISTS (SELECT 1 FROM events t WHERE t.job_id=a.job_id AND t.kind='account_done'
                                   AND t.at >= approved)""")]
 
 
@@ -1832,11 +1833,12 @@ def create_pending_accounts() -> None:
             if not pending:
                 return
             try:
-                create_account(pending[0], cfg)
+                outcome = create_account(pending[0], cfg)
             except Exception as exc:  # nunca dejar la oferta trabada en «creando»
-                with connect() as db:
-                    log_event(db, pending[0], "account_attempt", f"error: {exc}"[:300])
+                outcome = f"error: {exc}"[:300]
                 _account_failed(pending[0], f"error interno al crear la cuenta: {exc}"[:300])
+            with connect() as db:
+                log_event(db, pending[0], "account_done", str(outcome))
 
 
 def _account_failed(job_id: int, why: str) -> None:
@@ -1923,7 +1925,7 @@ def _finish_account(job_id: int, job: dict, cfg: dict, result: dict) -> str:
         return "requeued"
     if status == "exists":
         _account_failed(job_id, "el portal dice que ya tenés una cuenta con tu mail. No reseteo la contraseña sin "
-                                "tu sí: entrá vos o decime que la resetee.")
+                                "tu sí: entrá vos, o pedile a Claude en el chat que la resetee.")
         return "exists"
     if status != "ready" or not result["signup_url"].startswith("http") or not result["submit_label"].strip():
         _account_failed(job_id, reason)
@@ -1954,7 +1956,7 @@ def _finish_account(job_id: int, job: dict, cfg: dict, result: dict) -> str:
         return "created"
     if code == 4:
         _account_failed(job_id, "el portal dice que ya tenés una cuenta con tu mail. No reseteo la contraseña sin "
-                                "tu sí: entrá vos o decime que la resetee.")
+                                "tu sí: entrá vos, o pedile a Claude en el chat que la resetee.")
         return "exists"
     _account_failed(job_id, line.split(":", 1)[-1].strip() or "login.py no pudo crear la cuenta")
     return "failed"
