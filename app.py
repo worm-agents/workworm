@@ -374,7 +374,12 @@ with board:
                     "enviás en la pestaña: el agente se da cuenta solo (no hace falta volver acá)." if on else
                     "El agente llena cada formulario en el Chrome de la VM y vos solo resolvés el captcha y enviás. "
                     "Videos y cuentas nuevas no entran.") + f" Enviadas hoy en tandas: {sent_today}.")
-        if on:
+        if on:  # Jero 23/11: «hice clic en empezar tanda y no parece haber pasado nada» → qué está haciendo ahora
+            doing = next((x for x in items if x["state"] in ("filling", "checked")), None)
+            waiting_n = len([x for x in items if x["state"] in ("ready", "opening")])
+            queued_n = len([x for x in items if x["state"] == "queued"])
+            c2.markdown(f"**Ahora:** {'llenando ' + (doing['company'] or '?') if doing else 'esperándote' if waiting_n else 'buscando el próximo'}"
+                        f" · {waiting_n} te esperan · {queued_n} en cola")
             if c3.button("Terminar tanda", key="tanda-stop", width="stretch"):
                 tanda.stop()
                 st.rerun()
@@ -382,6 +387,7 @@ with board:
             if c2.button(f"▶ Empezar tanda ({len(pending) or len(tanda.candidates())})", key="tanda-start",
                          type="primary", width="stretch"):
                 tanda.start()
+                st.toast("Tanda arrancada: el agente abre los formularios en el Chrome de la VM (el primero tarda 2 a 5 min)")
                 st.rerun()
         labels = {"ready": "LISTO: resolvé el captcha y enviá",
                   "opening": "TE ESPERA: pasá la verificación o el captcha en la pestaña y tocá «Listo» (el agente sigue)",
@@ -433,6 +439,12 @@ with board:
                        + " · ".join(f"{x['company']}" for x in failed))
 
     tanda_panel()
+    creating = agent.accounts_pending()
+    if creating:  # Jero 23/11: «hice clic en crear las cuentas, tampoco pareció hacer nada» → progreso visible
+        names = [(radar.job(i) or {}).get("company") or "?" for i in creating]
+        st.info(f"Creando cuentas en el Chrome de la VM, de a una (4 a 8 min cada una): ahora **{names[0]}**"
+                + (f"; después {', '.join(names[1:6])}{'…' if len(names) > 6 else ''}" if len(names) > 1 else "")
+                + ". El resultado de cada una llega en el mail de pendientes y la oferta vuelve a la cola sola.")
     attention_jobs = [j for j in radar.jobs("action_needed")]
     if attention_jobs:
         st.markdown(f"### [!!] Requieren tu atención · {len(attention_jobs)}")

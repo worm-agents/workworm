@@ -123,11 +123,36 @@ def touch() -> None:
     (radar.ROOT / "data" / "tanda.touch").write_text(now(), encoding="utf-8")
 
 
+ORPHAN_MINUTES = 30  # un «listo» o «esperando verificación» cuya pestaña ya no existe vuelve a la cola
+
+
+def heal_orphans() -> int:
+    """Filas «ready»/«opening» de tandas viejas cuya pestaña se cerró: ocupaban los lugares de AHEAD y la tanda nueva no
+    arrancaba nunca (Jero 23/11: «hice clic en empezar tanda y no pasó nada»; había tres del 20/11). Vuelven a la cola."""
+    try:
+        alive = {t["id"] for t in agent.vm_tabs()}
+    except Exception:
+        return 0
+    healed = 0
+    with agent.connect() as db:
+        _table(db)
+        for r in db.execute("SELECT job_id, tabs, updated_at FROM tanda WHERE state IN ('ready', 'opening')").fetchall():
+            ids = json.loads(r["tabs"] or "[]")
+            age = radar.parse_time(r["updated_at"])
+            old = age is None or (datetime.now(timezone.utc) - age).total_seconds() > ORPHAN_MINUTES * 60
+            if old and not (set(ids) & alive):
+                db.execute("UPDATE tanda SET state='queued', tabs='[]', detail='Su pestaña se había cerrado: vuelve a llenarse', "
+                           "updated_at=? WHERE job_id=?", (now(), r["job_id"]))
+                healed += 1
+    return healed
+
+
 def start() -> int:
     if not active():  # una tanda cortada a mitad de un llenado lo deja en «filling»: vuelve a la cola
         with agent.connect() as db:
             _table(db)
             db.execute("UPDATE tanda SET state='queued', detail='' WHERE state IN ('filling', 'checked')")
+    heal_orphans()
     added = build()
     STOP.unlink(missing_ok=True)
     touch()
@@ -451,8 +476,14 @@ def worker() -> None:
     HEARTBEAT.unlink(missing_ok=True)
 
 
+_LAST_HEAL = [0.0]
+
+
 def _step() -> None:
     cfg = radar.config()  # cada vuelta: las reglas nuevas de config.json valen sin reiniciar
+    if time.time() - _LAST_HEAL[0] > 60:
+        _LAST_HEAL[0] = time.time()
+        heal_orphans()
     if True:
         HEARTBEAT.write_text(now(), encoding="utf-8")
         items = rows()

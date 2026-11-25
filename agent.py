@@ -1116,7 +1116,7 @@ def verify_emails(service, cfg: dict, report: dict) -> None:
         done = {r["gmail_id"] for r in db.execute("SELECT gmail_id FROM verify_done")}
     if not companies:
         return
-    q = "newer_than:2d -in:sent -in:spam -in:trash (verify OR verification OR confirm OR confirmar OR verificar OR activate OR validate)"
+    q = "newer_than:7d -in:sent -in:spam -in:trash (verify OR verification OR confirm OR confirmar OR verificar OR activate OR validate)"
     listing = gmail_exec(service.users().messages().list(userId="me", q=q, maxResults=25))
     for item in listing.get("messages", []):
         if item["id"] in done:
@@ -1849,6 +1849,93 @@ def _account_failed(job_id: int, why: str) -> None:
            "Podés crearla vos en la pantalla del agente y tocar «Listo, reintentar», o descartar la oferta.")
 
 
+SIGNUP_FINISH_SCHEMA = {
+    "type": "object",
+    "properties": {"status": {"type": "string", "enum": ["done", "needs_login", "verify_pending", "needs_human"]},
+                   "reason": {"type": "string", "description": "Una o dos oraciones en español"}},
+    "required": ["status", "reason"],
+}
+
+
+def _finish_prompt(job: dict, cfg: dict, login: str) -> str:
+    return (
+        f"La cuenta de {cfg['candidate_name']} en el portal de empleo de {job['company']} YA SE CREÓ (el mail "
+        f"{cfg['candidate_email']} y la contraseña los cargó otro programa). Puede que el portal tenga pasos de registro "
+        "pendientes después de la contraseña (por ejemplo UKG «Almost there» / «Create Account» con nombre y apellido, "
+        "completar perfil, aceptar términos).\n\n"
+        f"Abrí una PESTAÑA NUEVA en {login} (y si hace falta la oferta: {job['url']}).\n"
+        "- Si aparece un paso pendiente del REGISTRO, completalo con los datos del perfil (nombre, apellido, teléfono, "
+        "país, DNI si lo pide) y tocá el botón que termina el registro (Create Account, Continue, Save, Finish). Marcá solo "
+        "los términos y la privacidad obligatorios; dejá sin marcar newsletters y opcionales.\n"
+        "- NUNCA escribas nada en un campo de contraseña. Si el portal pide la contraseña para entrar, devolvé needs_login.\n"
+        "- Si el portal dice que hay que verificar el mail para seguir, devolvé verify_pending.\n"
+        "- No postules todavía ni completes el formulario de la oferta: eso lo hace otro paso. Cuando ya no quede nada del "
+        "registro (se ve la cuenta, el perfil o el formulario de la oferta), devolvé done.\n"
+        "- needs_human solo si algo no se puede completar con el perfil; decí qué en reason.\n"
+        "Cerrá la pestaña que abriste al terminar; no toques otras." + personal_form_rules())
+
+
+def signup_cv(job: dict, cfg: dict) -> str:
+    """CV para subir en registros que lo piden (SuccessFactors, Oorwin...): el adaptado a esta oferta si ya existe,
+    si no el CV base en el idioma de la oferta. Jero 23/11: en Capgemini el registro quedó trabado por el CV."""
+    with connect() as db:
+        row = db.execute("SELECT cv_path FROM applications WHERE job_id=?", (job["id"],)).fetchone()
+    path = Path(row["cv_path"]) if row and row["cv_path"] else None
+    if path and path.exists():
+        return str(path)
+    try:
+        cv = cv_for(cfg, detect_language(job.get("description") or ""))
+        return str(upload_copy(cv))
+    except Exception:
+        return ""
+
+
+def retry_account(job_id: int) -> None:
+    """Reintenta un alta que Jero ya aprobó para esta oferta (su sí sigue valiendo para esa cuenta)."""
+    with connect() as db:
+        log_event(db, job_id, "account_approved", "reintento del sí que Jero ya dio para esta cuenta")
+        db.execute("UPDATE applications SET note=?, updated_at=? WHERE job_id=?",
+                   ("CUENTA: creando la cuenta (reintento)…", now(), job_id))
+        db.execute("UPDATE jobs SET status='action_needed' WHERE id=?", (job_id,))
+
+
+def finish_signup(job_id: int, cfg: dict, key: str, login: str, hints: list[str]) -> str:
+    """Después de `login.py crear`: el agente termina los pasos de registro que quedaron (sin contraseñas), entra solo
+    si el portal pide sesión, y abre el link de verificación del mail cuando el portal lo pide al final."""
+    job = radar.job(job_id)
+    started = time.time() - 900  # el mail pudo salir apenas se envió el registro
+    status = "needs_human"
+    for attempt in range(3):
+        try:
+            result = llm.ask(system_prompt(cfg), _finish_prompt(job, cfg, login), SIGNUP_FINISH_SCHEMA,
+                             model=cfg["autopilot"].get("model", "sonnet"), timeout=12 * 60,
+                             extra=["--mcp-config", str(mcp_config(cfg)), "--strict-mcp-config",
+                                    "--allowedTools", "mcp__playwright",
+                                    "--disallowedTools", "mcp__playwright__browser_close"])
+        except llm.LLMError as exc:
+            return f"el agente falló ({exc})"
+        status = result["status"]
+        with connect() as db:
+            log_event(db, job_id, "account_finish", f"{status}: {result['reason']}"[:300])
+        if status == "done":
+            return "done"
+        if status == "needs_login" and attempt < 2:
+            if not auto_login(key):
+                return "el portal pide la contraseña y el login automático no entró"
+            continue
+        if status == "verify_pending" and attempt < 2:
+            try:
+                r = subprocess.run([str(LOGIN_PYTHON), "-I", str(LOGIN_PY), "link", f"--desde={int(started)}",
+                                    f"--pistas={','.join(hints)}"], capture_output=True, text=True, timeout=240)
+            except subprocess.TimeoutExpired:
+                return "verify_pending"
+            if r.returncode != 0:
+                return "verify_pending"  # el ciclo vuelve a mirar los mails de verificación (verify_emails)
+            continue
+        return result["reason"] if status == "needs_human" else status
+    return status
+
+
 def create_account(job_id: int, cfg: dict, dry_run: bool = False):
     """Alta de la cuenta que pide una oferta. Exige el sí de Jero registrado para esa oferta (account_approved).
     dry_run: ensayo sin sí ni registro en la base; el agente deja el formulario completo SIN enviar y devuelve lo que
@@ -1881,6 +1968,7 @@ def _signup_fill(job: dict, cfg: dict) -> dict:
     """El agente completa el registro sin contraseña y sin enviar. Devuelve SIGNUP_FILL_SCHEMA."""
     ensure_browser()
     start = job.get("login_url") or job["url"]
+    cv_file = signup_cv(job, cfg)
     prompt = (
         f"Tenés que dejar listo el REGISTRO (crear cuenta) del portal de empleo que pide esta oferta, para "
         f"{cfg['candidate_name']}. Jero ya aprobó crear esta cuenta.\n\n"
@@ -1893,8 +1981,12 @@ def _signup_fill(job: dict, cfg: dict) -> dict:
         "registrarse con Google, devolvé google_only.\n"
         "3. Completá TODOS los campos del registro con los datos del perfil: mail, nombre, apellido, teléfono, país, "
         "DNI si lo pide, etc.\n"
+        + (f"   Si el registro pide el CV (Resume/CV/Currículum), subí este archivo con la herramienta de carga: {cv_file}\n"
+           if cv_file else "") +
         "4. Casillas: marcá SOLO las obligatorias de términos, condiciones y política de privacidad estándar. Dejá SIN "
-        "marcar newsletters, marketing, «talent community», alertas por mail u otras opcionales. Si para registrarse "
+        "marcar newsletters, marketing, «talent community», alertas por mail u otras opcionales. Si la ÚNICA casilla "
+        "obligatoria para registrarse mezcla términos o privacidad con comunicaciones, marcala igual (Jero 23/11: sin "
+        "ella no hay cuenta, y los mails se pueden dar de baja). Si para registrarse "
         "hay que aceptar algo que no sea estándar (declaraciones juradas, cesión de derechos, pagos, compromisos "
         "fuera de lo común), devolvé needs_human sin marcarlo.\n"
         "5. NUNCA escribas nada en los campos de contraseña ni de repetir contraseña: dejalos vacíos. Los completa "
@@ -1949,6 +2041,11 @@ def _finish_account(job_id: int, job: dict, cfg: dict, result: dict) -> str:
     with connect() as db:
         log_event(db, job_id, "account_created" if code == 0 else "account_failed", line[:300])
     if code == 0:
+        # Registros en varios pasos (UKG «Almost there», perfiles): el agente los termina sin tocar contraseñas
+        done = finish_signup(job_id, cfg, key, login, hints)
+        if done not in ("done", "verify_pending"):
+            _account_failed(job_id, f"la cuenta quedó creada pero no pude terminar el registro: {done}")
+            return "failed"
         retry_after_account(job_id)
         notify(None, cfg, f"Cuenta creada para {job['company']}",
                f"{job['title']} en {job['company']}\nCreé la cuenta en {radar.urlparse(login).netloc} con "
