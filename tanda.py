@@ -238,22 +238,35 @@ SCROLL_JS = """() => {
 }"""
 
 
+def page_eval(target_id: str, function_js: str, timeout: float = 10) -> object:
+    """Corre una función JS en una pestaña del Chrome del agente por CDP directo (websocket de /json/list), sin Playwright.
+    La tanda no usa Playwright: el vigía corre en otro hilo y dos Playwright a la vez en el mismo proceso terminaron en
+    segfault (23/11, tanda caída a mitad). Además no levanta un driver de Node cada 8 segundos."""
+    from websockets.sync.client import connect
+    url = f"ws://127.0.0.1:{agent.ASSIST_PORT}/devtools/page/{target_id}"
+    deadline = time.time() + timeout
+    with connect(url, open_timeout=timeout, close_timeout=2, max_size=None) as ws:
+        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                            "params": {"expression": f"({function_js})()", "returnByValue": True}}))
+        while True:
+            msg = json.loads(ws.recv(timeout=max(deadline - time.time(), 0.1)))
+            if msg.get("id") == 1:
+                result = msg.get("result") or {}
+                if "exceptionDetails" in result or "error" in msg:
+                    raise RuntimeError(str(result.get("exceptionDetails") or msg.get("error"))[:200])
+                return (result.get("result") or {}).get("value")
+
+
 def scroll_to_captcha(tab_ids: list[str]) -> str:
     """Deja la pestaña con el captcha (o el botón de enviar) en el medio de la pantalla. Jero 20/11: «no me dejó
     scrolleado en el captcha»."""
-    from playwright.sync_api import sync_playwright
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{agent.ASSIST_PORT}", timeout=15000)
-            for ctx in browser.contexts:
-                for page in ctx.pages:
-                    session = ctx.new_cdp_session(page)
-                    target = session.send("Target.getTargetInfo")["targetInfo"]["targetId"]
-                    session.detach()
-                    if target in tab_ids:
-                        return page.evaluate(SCROLL_JS) or ""
-    except Exception as exc:  # nunca frena la tanda
-        return f"error: {exc}"
+    open_ids = {t["id"] for t in agent.vm_tabs()}
+    for target in tab_ids:
+        if target in open_ids:
+            try:
+                return page_eval(target, SCROLL_JS) or ""
+            except Exception as exc:  # nunca frena la tanda
+                return f"error: {exc}"
     return ""
 
 
@@ -377,7 +390,6 @@ def _watch_once(seen_challenge: dict) -> None:
     pestañas y la tanda seguía esperando su «Listo»):
     - opening: si ya hay token de captcha, o había Cloudflare y ya no está → el agente sigue (checked);
     - ready: si la página dice que la postulación salió → enviada."""
-    from playwright.sync_api import sync_playwright
     waiting = {}
     for r in rows():
         if r["state"] in ("opening", "ready"):
@@ -385,30 +397,29 @@ def _watch_once(seen_challenge: dict) -> None:
                 waiting[t] = r
     if not waiting:
         return
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{agent.ASSIST_PORT}", timeout=15000)
-        for ctx in browser.contexts:
-            for page in ctx.pages:
-                try:
-                    session = ctx.new_cdp_session(page)
-                    target = session.send("Target.getTargetInfo")["targetInfo"]["targetId"]
-                    session.detach()
-                    r = waiting.get(target)
-                    if not r:
-                        continue
-                    state = page.evaluate(PAGE_JS)
-                except Exception:
-                    continue
-                job_id = r["job_id"]
-                if state["cloudflare"]:
-                    seen_challenge[job_id] = True
-                if r["state"] == "ready" and state["success"]:
-                    touch()
-                    sent(job_id)
-                elif (r["state"] == "opening" and not state["cloudflare"] and (state["token"] or not state["captcha"])
-                      and (datetime.now(timezone.utc) - radar.parse_time(r["updated_at"])).total_seconds() > 15):
-                    touch()
-                    _set(job_id, state="checked", detail="Pasaste la verificación: el agente sigue en esa pestaña")
+    open_ids = {t["id"] for t in agent.vm_tabs()}
+    done = set()
+    for target, r in waiting.items():
+        job_id = r["job_id"]
+        if target not in open_ids or job_id in done:
+            continue
+        try:
+            state = page_eval(target, PAGE_JS)
+        except Exception:  # pestaña cargando, con un diálogo abierto o recién cerrada: la próxima vuelta
+            continue
+        if not isinstance(state, dict):
+            continue
+        if state["cloudflare"]:
+            seen_challenge[job_id] = True
+        if r["state"] == "ready" and state["success"]:
+            touch()
+            sent(job_id)
+            done.add(job_id)
+        elif (r["state"] == "opening" and not state["cloudflare"] and (state["token"] or not state["captcha"])
+              and (datetime.now(timezone.utc) - radar.parse_time(r["updated_at"])).total_seconds() > 15):
+            touch()
+            _set(job_id, state="checked", detail="Pasaste la verificación: el agente sigue en esa pestaña")
+            done.add(job_id)
 
 
 def _watcher() -> None:
