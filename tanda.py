@@ -425,6 +425,10 @@ def _watcher() -> None:
 
 def worker() -> None:
     import threading
+    # systemd lo reinicia si se cae (segfault del 23/11 a mitad de una tanda): lo que estaba llenando vuelve a la cola.
+    with agent.connect() as db:
+        _table(db)
+        db.execute("UPDATE tanda SET state='queued', detail='' WHERE state='filling'")
     agent.ensure_browser()
     threading.Thread(target=_watcher, daemon=True).start()
     while not STOP.exists() and not idle():
