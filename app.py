@@ -280,9 +280,10 @@ def control_panel():
             at = "solo a mano"
         left.markdown(f"<div class='status-line'><b>{state}</b> &nbsp;·&nbsp; próxima revisión {at or '—'}</div>",
                       unsafe_allow_html=True)
-        if mid.button("▶ REVISAR AHORA", type="primary", width="stretch", key="start-cycle",
-                      help="No hace falta: el agente corre solo. Sirve para no esperar a la próxima revisión."):
-            agent.start_cycle()
+        if mid.button("▶ CORRER AHORA", type="primary", width="stretch", key="start-cycle",
+                      help="Cuando terminaste lo que te tocaba (logins, Cloudflare, códigos): el agente reintenta en el "
+                           "momento, antes de que se venza la sesión. No busca ofertas nuevas, así es rápido."):
+            agent.start_cycle(force_collect=False)
             st.session_state["start_clicked"] = time.time()
             st.rerun()
     toggled = right.toggle("PILOTO ACTIVO" if pilot_now["enabled"] else "PILOTO EN PAUSA", value=pilot_now["enabled"],
@@ -317,7 +318,7 @@ for notice in dict.fromkeys(gmail_expired()):
 _sched = scheduler_status()
 if _sched["state"] in ("missing", "moved", "disabled"):
     _warn, _fix = st.columns([5, 1.4], vertical_alignment="center")
-    _warn.warning(f"[!!] {_sched['detail']} El agente no corre solo: solo cuando tocás «Revisar ahora».")
+    _warn.warning(f"[!!] {_sched['detail']} El agente no corre solo: solo cuando tocás «Correr ahora».")
     if _fix.button("Instalar tareas", key="install-tasks",
                    help="Registra en Windows las tareas «WorkWorm» (ciclo del agente) y «WorkWorm - Tablero» "
                         "para esta carpeta. También las habilita."):
@@ -367,7 +368,7 @@ with board:
             if b1.button(f"Abrir todos los logins ({len({radar.urlparse(j.get('login_url') or j['url']).netloc for j in account_jobs})} sitios)",
                          type="primary", width="stretch", disabled=bool(agent.running())):
                 agent.open_login_pages([j["id"] for j in account_jobs])
-                st.toast("Abiertos en el Edge del agente: entrá con Google en cada pestaña y cerrá la ventana")
+                st.toast("Abiertos en el Chrome de la VM: entrá con Google en cada pestaña y cerrá la ventana")
             if b2.button("Listo, reintentar todas", width="stretch"):
                 for j in account_jobs:
                     agent.retry_after_account(j["id"])
@@ -385,11 +386,14 @@ with board:
                             "y enviala. Después tocá «Ya me postulé» y el agente sigue la conversación por correo.")
                 with radar.connect() as db:
                     app_row = db.execute("SELECT body, cv_path FROM applications WHERE job_id=?", (j["id"],)).fetchone()
-                if box.button("Completar el formulario en el Edge del agente (vos resolvés el captcha y enviás)",
+                if box.button("Completar el formulario en el Chrome de la VM (vos resolvés el captcha y enviás)",
                               key=f"fin-assist-{j['id']}", type="primary", width="stretch", disabled=bool(agent.running())):
-                    with st.spinner("El agente está completando el formulario (3 a 10 min)…"):
-                        result = agent.assist_form(j["id"], cfg)
-                    (box.success if result["ready"] else box.warning)(result["detail"])
+                    import subprocess, sys
+                    subprocess.Popen([sys.executable, "-c", f"import agent, radar; agent.assist_form({j['id']}, radar.config())"],
+                                     cwd=str(radar.ROOT), start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    box.info("El agente lo está completando en el Chrome de la VM (3 a 10 min). Cuando termine queda en una "
+                             "pestaña nueva, lista para el captcha o el video, y te llega en el mail de pendientes.")
                 f1, f2, f3, f4 = box.columns(4)
                 f1.link_button("Abrir oferta", j["url"], width="stretch")
                 cv_file = Path(app_row["cv_path"]) if app_row and app_row["cv_path"] else None
@@ -418,7 +422,7 @@ with board:
                     box.caption("Abrí la oferta, tocá «Postularme» → «Continuar con Google» (o creá la cuenta), cerrá la "
                                 "ventana y «Listo, reintentar».")
                 a1, a2, a3 = box.columns(3)
-                if a1.button("Abrir login en el Edge del agente" if j.get("login_url") else "Abrir en el Edge del agente",
+                if a1.button("Abrir login en el Chrome de la VM" if j.get("login_url") else "Abrir en el Chrome de la VM",
                              key=f"acc-open-{j['id']}", type="primary", width="stretch"):
                     agent.open_login_pages([j["id"]])
                 if a2.button("Listo, reintentar", key=f"acc-retry-{j['id']}", width="stretch"):
@@ -468,7 +472,7 @@ with board:
                 if kind == "form":
                     agent.mark_applied_manually(j["id"])
                 else:
-                    radar.set_status(j["id"], "conversation", "Lo resolviste vos")
+                    agent.resolve_pending(j["company"], "Lo resolviste vos")  # also closes its Google Task and mail entry
                 st.rerun()
             if drop:
                 radar.set_status(j["id"], "discarded")
@@ -910,10 +914,11 @@ with sources_tab:
                 "contact": "Te escribieron"}
     rows = []
     for key, (name, how, apply_how) in radar.SOURCES.items():
-        problems = [e for e in errors if e.startswith(prefixes[key])]
-        rows.append({"Plataforma": name, "Activa": "Sí" if enabled[key] else "No",
+        problems = [e for e in errors if e.startswith(prefixes.get(key, name))]
+        rows.append({"Plataforma": name, "Activa": "Sí" if enabled.get(key, key == "ashby" and any(
+                         b["provider"] == "ashby" for b in cfg["boards"])) else "No",
                      "Ofertas encontradas": found.get(key, 0), "Postulaciones": applied_by.get(key, 0),
-                     "Última búsqueda": ("[!] " + problems[0][:80]) if problems else ("OK" if last and enabled[key] else "—"),
+                     "Última búsqueda": ("[!] " + problems[0][:80]) if problems else ("OK" if last and enabled.get(key) else "—"),
                      "Cómo se obtienen": how, "Cómo se postula": apply_how})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     st.caption("Empresas seguidas por API: " + ", ".join(f"{b['name']} ({b['provider']})" for b in cfg["boards"])
@@ -1113,9 +1118,9 @@ with settings_general:
         st.subheader("Navegador del agente")
         st.write("Para formularios y LinkedIn el agente abre un Edge aparte, con su propio perfil, y lo cierra al terminar. "
                  "Iniciá sesión una vez en ese Edge en Indeed, Get on Board, Computrabajo y Bumeran. LinkedIn no se usa: ahí te postulás vos.")
-        if st.button("Abrir Edge del agente"):
+        if st.button("Abrir Chrome de la VM"):
             agent.open_agent_edge()
-            st.info("Se abrió el Edge del agente. Iniciá sesión y cerralo. No lo uses mientras corre un ciclo.")
+            st.info("Se abrió el Chrome de la VM. Iniciá sesión y cerralo. No lo uses mientras corre un ciclo.")
         st.subheader("Último ciclo")
         log_path = radar.ROOT / "data" / "scheduler.log"
         lines = [l for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip()] if log_path.exists() else []

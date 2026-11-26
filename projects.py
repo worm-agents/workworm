@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ import radar
 ROOT = radar.ROOT
 STATE = ROOT / "data" / "projects.json"
 WORKDIR = Path.home() / "Documents" / "workworm-projects"
+TOOLCHAINS = Path.home() / "toolchains"  # compilers and runtimes the agent installs itself, without root
 SAFE_TECH = re.compile(r"^[A-Za-z0-9 .+#/_-]{1,40}$")
 
 SCHEMA = {
@@ -54,8 +56,16 @@ PROMPT = (
     "baratos; no son obligatorios.\n"
     "- Idea concreta y util (una API, CLI o app chica con 3 a 5 funciones), no un hola mundo. Unos 150 a 400 lineas.\n"
     "- README en espanol, honesto: describe lo que hace y como correrlo. Dice que es un proyecto de practica.\n"
-    "- Directorio de trabajo: {dir}. Crea ahi una carpeta nueva. Usa solo herramientas ya instaladas o instalables "
-    "con el gestor del lenguaje; si falta un toolchain grande y no podes correrlo, devolve ok=false con el motivo.\n"
+    "- Directorio de trabajo: {dir}. Crea ahi una carpeta nueva.\n"
+    "- Si falta el toolchain (compilador, runtime, gestor de paquetes, base de datos local), instalalo vos, sin pedirle "
+    "nada a nadie. No hay sudo: no lo intentes. Primero fijate si ya esta en el PATH o en {toolchains}/bin. Si no: "
+    "paquetes oficiales de Ubuntu 24.04 arm64 con `apt-get download <paquete>` y `dpkg -x` dentro de "
+    "{toolchains}/<nombre> (con `ldd` ves que librerias faltan y las bajas igual), o el binario oficial del proyecto "
+    "(go.dev, nodejs.org, etc.) verificando el checksum o la firma que publica. Nunca scripts de fuentes no oficiales. "
+    "Deja en {toolchains}/bin (ya esta en el PATH) un ejecutable o un wrapper que exporte lo que haga falta "
+    "(LD_LIBRARY_PATH, PHPRC, JAVA_HOME...) para que tambien anden los procesos hijos, y anota en "
+    "{toolchains}/README.md que instalaste, version, de donde y como. Devolve ok=false solo si de verdad no se puede "
+    "correr en Linux arm64 (pide hardware u otro sistema operativo), y deci en reason que falto.\n"
     "- git init en main, commits con GIT_AUTHOR_NAME/GIT_COMMITTER_NAME={git_name} y "
     "GIT_AUTHOR_EMAIL/GIT_COMMITTER_EMAIL={git_email}, sin mencionar a Claude en commits ni README.\n"
     "- Subilo con `gh repo create {owner}/<nombre> --public --source . --push`.\n"
@@ -65,7 +75,7 @@ PROMPT = (
     "un trial que pida tarjeta; si el servicio la pide, no lo uses y resolvelo sin el servicio o devolve ok=false. "
     "Si piden CAPTCHA o un codigo que no podes leer, frenate igual. Los tokens van a ~/.workworm/accounts/ "
     "(nunca dentro del repo ni en commits ni en el README) y anota ahi que cuenta creaste y donde.\n"
-    "- No toques nada fuera de {dir} y ~/.workworm/accounts/. No leas ni uses archivos personales.\n"
+    "- No toques nada fuera de {dir}, {toolchains} y ~/.workworm/accounts/. No leas ni uses archivos personales.\n"
     "Devolve ok, repo_url, name y summary."
 )
 
@@ -121,12 +131,16 @@ def build(tech: str, cfg: dict) -> dict | None:
     if not exe:
         return None
     WORKDIR.mkdir(parents=True, exist_ok=True)
+    (TOOLCHAINS / "bin").mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "PATH": os.pathsep.join([str(TOOLCHAINS / "bin"), str(Path.home() / ".local" / "bin"),
+                                                  os.environ.get("PATH", "")])}
     cmd = [exe, "-p", "--model", s["model"], "--effort", s["effort"], "--output-format", "json",
            "--no-session-persistence", "--strict-mcp-config", "--json-schema", json.dumps(SCHEMA),
            "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep",
-           "--add-dir", str(WORKDIR)]
+           "--add-dir", str(WORKDIR), "--add-dir", str(TOOLCHAINS)]
     try:
-        done = subprocess.run(cmd, input=PROMPT.format(tech=tech, dir=WORKDIR, **_identity()), capture_output=True, text=True,
+        done = subprocess.run(cmd, input=PROMPT.format(tech=tech, dir=WORKDIR, toolchains=TOOLCHAINS, **_identity()), env=env,
+                              capture_output=True, text=True,
                               encoding="utf-8", cwd=str(WORKDIR), timeout=s["timeout_minutes"] * 60,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         result = json.loads(done.stdout)
