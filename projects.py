@@ -159,10 +159,14 @@ def build(tech: str, cfg: dict) -> dict | None:
     return record
 
 
+# Línea del perfil antes de la cual se insertan los proyectos nuevos (si no está, van al final)
+PROFILE_MARKER = "  - <!-- proyectos -->"
+
+
 def _add_to_profile(p: dict) -> None:
     path = ROOT / "profile.md"
     text = path.read_text(encoding="utf-8")
     line = f"  - {p['name']} ({datetime.now().strftime('%b %Y').lower()}): {p['summary']} {p['repo_url']}\n"
-    marker = "  - <!-- proyectos -->"
+    marker = PROFILE_MARKER
     text = text.replace(marker, line + marker, 1) if marker in text else text + "\n" + line
     path.write_text(text, encoding="utf-8")

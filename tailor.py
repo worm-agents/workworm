@@ -273,12 +273,7 @@ def ask_claude(job: dict, facts: dict, cfg: dict, language: str, as_email: bool,
         f"- Resumen: 2 o 3 oraciones, máximo 3 renglones. Abrí presentándome como {headline} y poné primero la experiencia "
         "real más relevante para ese nicho, con hechos del CV y del perfil. "
         + ("" if "full stack" in headline.lower() else "No uses la expresión «full stack» en el resumen ni en las habilidades nuevas. ")
-        + "Hechos verdaderos disponibles: en [empresa anterior] (retail, analista y analytics engineer, ene 2024 a ago 2026) ETL y "
-        "pipelines en Python, AWS (S3, IAM, boto3), Snowflake, PostgreSQL, Star Schema, Power BI; en [empresa actual] (ago 2026 a hoy) "
-        "integraciones, backend, machine learning y agentes LLM; certificación Azure Databricks Data Engineer Associate "
-        ". Para frontend o backend: React, TypeScript, Next.js, Node y Supabase en [empresa actual].\n"
-        "- No afirmes más de 3 años de experiencia en datos ni más de 1 en software full time. Nunca menciones WordPress, "
-        "Shopify ni Java/Spring: no tengo experiencia en eso.\n"
+        + (((cfg.get("tailoring") or {}).get("niche_facts") or "").strip() + "\n") +
         "- Viñetas: dentro de cada rol, poné primero las que más pesan para el nicho. Habilidades: poné primero la línea de "
         "la categoría del nicho y dentro de cada línea lo más relevante primero.\n"
         "- project_order: ordená los proyectos con los del nicho primero; devolvé todos los índices sin repetir.\n"

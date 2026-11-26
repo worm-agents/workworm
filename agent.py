@@ -1035,7 +1035,7 @@ FORM_FACTS = (
     "quedado vacío. Si al volver a mirar el formulario está vacío, cargalo de nuevo.\n"
     "- No menciones pasos, verificaciones ni bloqueos (por ejemplo Cloudflare) que no viste en la pantalla.\n"
     "- Teléfono: si el formulario tiene el código de país aparte (bandera, +54), escribí solo los dígitos sin espacios ni "
-    "guiones (XXXXXXXXXX); si es un solo campo, +54XXXXXXXXXX. Después de cargar cada campo mirá si aparece un mensaje de "
+    "guiones (el número local del perfil); si es un solo campo, con el código de país adelante (+54...). Después de cargar cada campo mirá si aparece un mensaje de "
     "error («numbers only», «formato inválido», texto en rojo) y corregilo antes de dejarlo listo.\n")
 
 
@@ -2800,7 +2800,7 @@ GCAL_TOKEN = Path.home() / ".config" / "google-tasks" / "calendar-token.json"
 
 def gcal_interview(job: dict, interview_at: str, link: str, summary: str, confirmed: bool,
                    minutes: int = 60) -> str:
-    """Jero (19/11): every interview lands on his Google Calendar (primary) by itself. One event per offer,
+    """Every interview lands on the candidate's primary Google Calendar by itself. One event per offer,
     found by the private property workworm_job: a reschedule moves it, a confirmation drops «(a confirmar)».
     Returns a line for the log/mail; never raises."""
     try:

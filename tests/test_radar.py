@@ -772,7 +772,7 @@ class SameOfferAndManualApplyTests(unittest.TestCase):
             db.execute("""INSERT INTO applications(job_id,recipient,subject,body,status,channel,updated_at)
                           VALUES(?,?,?,?,?,?,?)""", (job_id, "", "", "", "not_sent", "form", "2026-11-05T10:00:00+00:00"))
         radar.set_status(job_id, "action_needed", "No se pudo postular: hCaptcha")
-        body = base64.urlsafe_b64encode("Hey Jerónimo, thank you for applying to Data Engineer at Mutt Data".encode()).decode()
+        body = base64.urlsafe_b64encode("Hey Ana, thank you for applying to Data Engineer at Mutt Data".encode()).decode()
         message = {"id": "g1", "threadId": "th1", "internalDate": "1793990000000",
                    "payload": {"mimeType": "text/plain", "body": {"data": body},
                                "headers": [{"name": "From", "value": "Muttdata <no-reply@hire.lever.co>"},

@@ -103,8 +103,8 @@ def draft(job: dict, facts: dict, cfg: dict, s: dict) -> dict:
         "este puesto, un proyecto del que estés orgulloso, más las que mencione la investigación). 80 a 150 palabras "
         "cada una.\n"
         "- Si la empresa pide no usar IA para escribir la postulación, ponelo primero en blockers.\n"
-        "- worth_it=false solo si hay un bloqueo claro para alguien que vive en Argentina, estudia en la universidad y tiene "
-        "unos 2 años de experiencia.\n\n"
+        "- worth_it=false solo si hay un bloqueo claro para el candidato según su CV y su perfil (dónde vive, "
+        "años de experiencia, estudios).\n\n"
         "=== INVESTIGACIÓN ===\n" + json.dumps(facts, ensure_ascii=False, indent=1)
         + "\n\n" + "\n\n".join(f"=== CV {k} ===\n{v}" for k, v in cvs.items())
         + f"\n\n=== AVISO ===\nCargo: {job['title']}\nEmpresa: {job['company']}\nUbicación: {job['location']}\n"
