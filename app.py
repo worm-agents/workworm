@@ -384,7 +384,8 @@ with board:
                 tanda.stop()
                 st.rerun()
         else:
-            if c2.button(f"▶ Empezar tanda ({len(pending) or len(tanda.candidates())})", key="tanda-start",
+            # Jero 25/11: «dice 83 y se abren 5»: el número es la cola entera; el agente abre de a pocas para no tapar la pantalla
+            if c2.button(f"▶ Empezar tanda ({len(pending) or len(tanda.candidates())} en cola, abre de a {tanda.AHEAD})", key="tanda-start",
                          type="primary", width="stretch"):
                 tanda.start()
                 st.toast("Tanda arrancada: el agente abre los formularios en el Chrome de la VM (el primero tarda 2 a 5 min)")
@@ -444,7 +445,7 @@ with board:
         names = [(radar.job(i) or {}).get("company") or "?" for i in creating]
         st.info(f"Creando cuentas en el Chrome de la VM, de a una (4 a 8 min cada una): ahora **{names[0]}**"
                 + (f"; después {', '.join(names[1:6])}{'…' if len(names) > 6 else ''}" if len(names) > 1 else "")
-                + ". El resultado de cada una llega en el mail de pendientes y la oferta vuelve a la cola sola.")
+                + ". El resultado de cada una queda acá, en su tarjeta, y la oferta vuelve a la cola sola (el mail de pendientes está apagado desde el 19/11).")
     attention_jobs = [j for j in radar.jobs("action_needed")]
     if attention_jobs:
         st.markdown(f"### [!!] Requieren tu atención · {len(attention_jobs)}")
@@ -491,7 +492,7 @@ with board:
                                      cwd=str(radar.ROOT), start_new_session=True,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     box.info("El agente lo está completando en el Chrome de la VM (3 a 10 min). Cuando termine queda en una "
-                             "pestaña nueva, lista para el captcha o el video, y te llega en el mail de pendientes.")
+                             "pestaña nueva, lista para el captcha o el video; lo ves en esta tarjeta.")
                 f1, f2, f3, f4 = box.columns(4)
                 f1.link_button("Abrir oferta", j["url"], width="stretch")
                 cv_file = Path(app_row["cv_path"]) if app_row and app_row["cv_path"] else None
@@ -521,7 +522,7 @@ with board:
                                 "ventana y «Listo, reintentar».")
                 creating = agent.account_creating(j["id"])
                 if creating:
-                    box.info("Creando la cuenta (lo aprobaste). Tarda unos minutos; el resultado llega en el mail.")
+                    box.info("Creando la cuenta (lo aprobaste). Tarda unos minutos; el resultado aparece en esta tarjeta.")
                 elif not agent.auto_login_site(j.get("login_url") or "", j["url"]):
                     if box.button(f"Sí, creá la cuenta (con {cfg['candidate_email']}, contraseña cifrada en el servidor)",
                                   key=f"acc-create-{j['id']}", type="primary", width="stretch"):

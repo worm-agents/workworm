@@ -282,6 +282,46 @@ def page_eval(target_id: str, function_js: str, timeout: float = 10) -> object:
                 return (result.get("result") or {}).get("value")
 
 
+def _cdp_call(ws, msg_id: int, method: str, params: dict, timeout: float = 10) -> dict:
+    ws.send(json.dumps({"id": msg_id, "method": method, "params": params}))
+    deadline = time.time() + timeout
+    while True:
+        msg = json.loads(ws.recv(timeout=max(deadline - time.time(), 0.1)))
+        if msg.get("id") == msg_id:
+            if "error" in msg:
+                raise RuntimeError(str(msg["error"])[:200])
+            return msg.get("result") or {}
+
+
+RESUME_INPUTS = ('input[type=file][name*="resume" i], input[type=file][id*="resume" i], input[type=file][name*="cv" i], '
+                 'input[type=file][id*="cv" i], input[type=file][name*="curriculum" i], input[type=file][accept*="pdf"]')
+
+
+def attach_cv(target_id: str, cv_path: str) -> bool:
+    """Pone el CV en el campo de CV de la pestaña por CDP (DOM.setFileInputFiles), sin modelo. Lo usa la tanda cuando el
+    sitio lo vació (Lever después de «error verifying your application», Jero 25/11) o el agente no lo dejó adjunto."""
+    from websockets.sync.client import connect
+    url = f"ws://127.0.0.1:{agent.ASSIST_PORT}/devtools/page/{target_id}"
+    with connect(url, open_timeout=10, close_timeout=2, max_size=None) as ws:
+        root = _cdp_call(ws, 1, "DOM.getDocument", {"depth": 0})["root"]["nodeId"]
+        nodes = _cdp_call(ws, 2, "DOM.querySelectorAll", {"nodeId": root, "selector": RESUME_INPUTS}).get("nodeIds") or []
+        if not nodes:
+            nodes = _cdp_call(ws, 3, "DOM.querySelectorAll", {"nodeId": root, "selector": "input[type=file]"}).get("nodeIds") or []
+        if not nodes:
+            return False
+        _cdp_call(ws, 4, "DOM.setFileInputFiles", {"nodeId": nodes[0], "files": [cv_path]})
+        return True
+
+
+def job_cv_path(job_id: int, cfg: dict) -> str:
+    info = radar.job(job_id)
+    with agent.connect() as db:
+        row = db.execute("SELECT cv_path FROM applications WHERE job_id=?", (job_id,)).fetchone()
+    if row and row["cv_path"] and agent.Path(row["cv_path"]).exists():
+        return row["cv_path"]
+    return str(agent.upload_copy(agent.cv_for(cfg, agent.application_language(info, cfg, ""))))
+
+
 def scroll_to_captcha(tab_ids: list[str]) -> str:
     """Deja la pestaña con el captcha (o el botón de enviar) en el medio de la pantalla. Jero 20/11: «no me dejó
     scrolleado en el captcha»."""
@@ -310,8 +350,12 @@ def _fill(job: dict, cfg: dict) -> None:
       resuelve y toca «Listo», sigue EN ESA MISMA PESTAÑA;
     - usa autopilot.tanda_model (sonnet por defecto): con haiku quedaban campos y casillas vacías (JPMorgan, AirTM, Humana)."""
     job_id = job["job_id"]
-    _set(job_id, state="filling", detail="El agente está llenando el formulario")
     info = radar.job(job_id)
+    if job["state"] == "queued" and agent._dead_link(job.get("url") or info["url"]):  # Jero 25/11: un 404 de Lever en la tanda
+        radar.set_status(job_id, "skipped", "El aviso ya no existe (404): sale de la tanda solo")
+        _set(job_id, state="skipped", detail="El aviso ya no existe (404)")
+        return
+    _set(job_id, state="filling", detail="El agente está llenando el formulario")
     with agent.connect() as db:
         app_row = db.execute("SELECT body, cv_path FROM applications WHERE job_id=?", (job_id,)).fetchone()
     letter = (app_row["body"] if app_row else "").split("\n\nRespuestas del formulario:")[0]
@@ -342,6 +386,12 @@ def _fill(job: dict, cfg: dict) -> None:
         "aparezca el mensaje de envío exitoso y devolvé outcome=sent.\n"
         "- Si hay un captcha o verificación (hCaptcha, reCAPTCHA, Cloudflare, «no soy un robot»), NO lo resuelvas ni envíes: "
         "scrolleá hasta que el captcha y el botón de enviar queden en el medio de la pantalla y devolvé outcome=ready.\n"
+        "- OJO con los captchas ocultos (Lever, Ashby, Workable: hay un iframe de hcaptcha o recaptcha aunque no se vea): "
+        "si en la página hay un iframe de captcha, NO pulses el botón de enviar. Dejá todo cargado con el botón a la vista "
+        "y devolvé outcome=ready: el candidato toca Enviar y resuelve el desafío en el momento (Jero 25/11: si el agente "
+        "toca Enviar antes, el desafío vence, Lever dice «There was an error verifying your application» y borra el CV). "
+        "Si ya lo tocaste y se abrió el desafío, cerralo con Escape sin resolverlo.\n"
+        "- Antes de devolver ready, confirmá que el CV quedó ADJUNTO (el nombre del archivo o «Success» junto al campo).\n"
         "- Si un captcha o verificación aparece ANTES de terminar (al abrir, en el primer paso, al tocar Next), frená ahí "
         "sin resolverlo, dejá esa pestaña en ese punto y devolvé outcome=verification.\n"
         "- Si no se puede (el aviso cerró, pide crear una cuenta con contraseña, falta un dato que el perfil no tiene), "
@@ -374,6 +424,13 @@ def _fill(job: dict, cfg: dict) -> None:
         _close_tabs(job_id)
     elif outcome == "ready":
         agent.set_hold(job_id, int(cfg["autopilot"].get("hold_minutes", 180)), tabs=tabs)
+        for target in tabs:  # el CV adjunto no depende de que el modelo se haya acordado
+            try:
+                state = page_eval(target, PAGE_JS)
+                if isinstance(state, dict) and state.get("cv_missing"):
+                    attach_cv(target, cv_path)
+            except Exception:
+                pass
         scroll_to_captcha(tabs)
         _set(job_id, state="ready", tabs=json.dumps(tabs), detail=detail)
         with agent.connect() as db:
@@ -384,10 +441,18 @@ def _fill(job: dict, cfg: dict) -> None:
         _set(job_id, mode="start", state="opening", tabs=json.dumps(tabs),
              detail="Apareció una verificación en el medio: resolvela en esa pestaña y tocá «Listo»; el agente sigue ahí. "
                     + detail)
+    elif CLOSED.search(detail):  # el aviso cerró: sale de la lista, no le llega a Jero
+        radar.set_status(job_id, "skipped", "El aviso ya no recibe postulaciones: " + detail[:300])
+        _set(job_id, state="skipped", tabs=json.dumps(tabs), detail=detail)
+        _close_tabs(job_id)
     else:
         _set(job_id, state="failed", tabs=json.dumps(tabs), detail=detail)
         with agent.connect() as db:
             agent.log_event(db, job_id, "tanda_failed", "El agente no lo pudo dejar listo: " + detail[:400])
+
+
+CLOSED = re.compile(r"404|not found|couldn.t find anything|no longer (accepting|available)|job (has been )?(closed|removed)|"
+                    r"posting (is )?(closed|removed)|ya no (est[aá] disponible|acepta|recibe)|aviso (cerr|vencid)", re.I)
 
 
 def idle() -> bool:
@@ -406,7 +471,13 @@ PAGE_JS = r"""() => {
   const cloudflare = /just a moment|un momento|verifying you are human|verificando que|additional verification|security verification/i.test(text);
   const success = /thank you for (applying|your application|your interest)|application (has been |was )?(submitted|received)|we('ve| have) received your application|gracias por (postularte|tu postulaci|aplicar|tu mensaje)|postulaci[oó]n (fue |ha sido )?(enviada|recibida)|mensaje ha sido enviado|successfully (submitted|applied)/i.test(text);
   const captcha = !!document.querySelector('iframe[src*="hcaptcha"], iframe[src*="recaptcha"], iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"], .h-captcha, .g-recaptcha, .cf-turnstile');
-  return {token, cloudflare, captcha, success};
+  const verifyError = /error verifying your application|please (upload|attach) (a|your) (resume|cv)|resume( is|\/cv is)? required|el cv es obligatorio/i.test(text);
+  const inputs = Array.from(document.querySelectorAll('input[type=file]'));
+  const resumeInput = inputs.find(i => /resume|cv|curriculum/i.test((i.name || '') + ' ' + (i.id || ''))) || inputs[0];
+  const shown = /\.pdf|success!|uploaded|adjunto|cargado/i.test(text);
+  const cv_missing = !!resumeInput && resumeInput.files.length === 0 && (verifyError || !shown);
+  const closed = /couldn.t find anything here|404 error|no longer accepting applications|this job is no longer available|job (posting )?(has been )?(closed|removed)/i.test(text);
+  return {token, cloudflare, captcha, success, verifyError, cv_missing, closed};
 }"""
 
 
@@ -440,6 +511,17 @@ def _watch_once(seen_challenge: dict) -> None:
             touch()
             sent(job_id)
             done.add(job_id)
+        elif state.get("closed"):
+            radar.set_status(job_id, "skipped", "El aviso ya no existe o cerró: sale de la tanda solo")
+            _close_tabs(job_id)
+            _set(job_id, state="skipped", detail="El aviso ya no existe o cerró")
+            done.add(job_id)
+        elif r["state"] == "ready" and state.get("verifyError") and state.get("cv_missing"):
+            try:
+                if attach_cv(target, job_cv_path(job_id, radar.config())):
+                    _set(job_id, detail="El sitio había borrado el CV: lo volví a adjuntar. Tocá Enviar de nuevo y resolvé el captcha.")
+            except Exception:
+                pass
         elif (r["state"] == "opening" and not state["cloudflare"] and (state["token"] or not state["captcha"])
               and (datetime.now(timezone.utc) - radar.parse_time(r["updated_at"])).total_seconds() > 15):
             touch()

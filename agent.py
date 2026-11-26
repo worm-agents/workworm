@@ -1799,8 +1799,21 @@ def approve_accounts(job_ids: list[int]) -> None:
             log_event(db, job_id, "account_approved", "sí de Jero en el tablero")
             db.execute("UPDATE applications SET note=?, updated_at=? WHERE job_id=?",
                        ("CUENTA: creando la cuenta (lo aprobaste en el tablero)…", now(), job_id))
-    subprocess.Popen([sys.executable, "-c", "import agent; agent.create_pending_accounts()"], cwd=str(radar.ROOT),
-                     start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    start_accounts_worker()
+
+
+def start_accounts_worker() -> None:
+    """Corre las altas en su propia unidad de systemd: un Popen colgado del tablero moría cada vez que se reiniciaba
+    workworm-dashboard (25/11: quedaron 7 cuentas aprobadas sin hacer). Si ya hay una corriendo, esa toma las nuevas."""
+    import sys
+    if IS_WINDOWS:
+        subprocess.Popen([sys.executable, "-c", "import agent; agent.create_pending_accounts()"], cwd=str(radar.ROOT),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    subprocess.run(["systemd-run", "--user", "--collect", f"--unit=workworm-accounts-{int(time.time())}",
+                    "--property=WorkingDirectory=" + str(radar.ROOT),
+                    str(radar.ROOT / "data" / "run_accounts.sh"), "import agent; agent.create_pending_accounts()"],
+                   capture_output=True, timeout=30)
 
 
 def accounts_pending() -> list[int]:
