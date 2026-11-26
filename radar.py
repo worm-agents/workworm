@@ -147,7 +147,8 @@ def at_home(location: str) -> bool:
     """Whether a normalized location is in the candidate's country."""
     h = home()
     code = re.escape(normalize(h["code"]))
-    return any(place in location for place in h["places"]) or bool(code and re.search(rf"\b{code}\b", location))
+    return any(place in location for place in h["places"]) or bool(code and re.search(rf"\b{code}\b", location)
+                                                                           and not re.search(rf"[a-z], {code}$", location))  # "Pine Bluff, AR" is Arkansas
 
 
 def _local_tz():
@@ -718,6 +719,40 @@ def parse_startupsargentina_detail(html: str) -> dict:
             "apply_url": apply_url}
 
 
+SA_MCP_CONFIG = ROOT / "data" / "mcp-startups.json"
+SA_MATCH_TAG = "[Match de Startups Argentina]"
+SA_MCP_ERRORS: list[str] = []
+
+
+def startupsargentina_matches() -> dict[str, dict]:
+    """Jero's personal matches from the Startups Argentina MCP (OAuth done once on the VM with
+    `claude mcp login startups-argentina --no-browser`, 2026-11-17). Read only: the only tool allowed is mis_matches.
+    Returns {external_id: match} for the matches still open; {} if the MCP fails (the scraper keeps working)."""
+    import llm
+    if not SA_MCP_CONFIG.exists():
+        SA_MCP_CONFIG.write_text(json.dumps({"mcpServers": {"startups-argentina": {
+            "type": "http", "url": STARTUPS_AR + "/api/mcp"}}}), encoding="utf-8")
+    item = {"type": "object", "properties": {**{k: {"type": "string"} for k in
+            ("url", "title", "company", "location", "mode", "why")}, "still_open": {"type": "boolean"}},
+            "required": ["url", "title", "company", "why", "still_open"]}
+    schema = {"type": "object", "properties": {"matches": {"type": "array", "items": item}}, "required": ["matches"]}
+    try:
+        out = llm.ask("Sos un extractor de datos. Llama una sola vez a mcp__startups-argentina__mis_matches y devolve "
+                      "todos los matches tal cual vienen, sin inventar ni resumir de mas. No uses ninguna otra herramienta.",
+                      "Trae mis matches de Startups Argentina.", schema, model="haiku", timeout=180,
+                      extra=["--mcp-config", str(SA_MCP_CONFIG), "--allowedTools", "mcp__startups-argentina__mis_matches"])
+    except Exception as exc:
+        SA_MCP_ERRORS.append(f"MCP de Startups Argentina (mis_matches): {exc}")
+        return {}
+    found = {}
+    for m in out.get("matches", []):
+        url = m.get("url", "")
+        parts = url.split("?")[0].split("/empleos/", 1)[-1].strip("/").split("/")
+        if m.get("still_open") and len(parts) >= 2 and "startupsargentina.com" in url:
+            found[parts[1]] = m
+    return found
+
+
 def fetch_startupsargentina(cfg: dict) -> list[dict]:
     """Startups Argentina (startupsargentina.com/empleos): server-rendered list pages plus each matching offer's page."""
     import time
@@ -744,6 +779,10 @@ def fetch_startupsargentina(cfg: dict) -> list[dict]:
             "SELECT external_id, url, description, posted_at FROM jobs WHERE source='startupsargentina'")}
         # Offers already stored from another platform are dropped by collect(); don't spend detail requests on them.
         repeated = {job["external_id"] for job in found if job["external_id"] not in known and duplicate(db, job)}
+    # Jero's personal matches (MCP, 2026-11-17): read their detail first and tag them, so scoring sees the reason.
+    SA_MCP_ERRORS.clear()
+    matches = startupsargentina_matches() if conf.get("mcp_matches", True) else {}
+    found.sort(key=lambda j: j["external_id"] not in matches)
     limit, fetched = int(conf.get("details_per_run", 30)), 0
     for job in found:
         row = known.get(job["external_id"])
@@ -765,6 +804,10 @@ def fetch_startupsargentina(cfg: dict) -> list[dict]:
             job["url"] = detail["apply_url"]  # apply straight on the employer's form
         fetched += 1
         time.sleep(1)
+    for job in found:
+        match = matches.get(job["external_id"])
+        if match and SA_MATCH_TAG not in (job.get("description") or ""):
+            job["description"] = f"{SA_MATCH_TAG} {match.get('why', '').strip()}\n\n{job.get('description') or ''}"
     return found
 
 
@@ -1168,6 +1211,8 @@ def collect() -> dict:
                 jobs.extend(fetch(cfg))
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
+            if key == "startupsargentina":
+                errors.extend(SA_MCP_ERRORS[:2])
             if key == "remote_boards":
                 errors.extend(f"Remotos (parcial): {e}" for e in REMOTE_ERRORS[:5])
     if cfg.get("gmail", {}).get("enabled"):
