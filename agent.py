@@ -839,6 +839,34 @@ def prepare_cv(job: dict, cv: dict, cfg: dict, decision: dict, as_email: bool) -
     return {**cv, "send_path": str(result["pdf"]), "added": result["added"]}
 
 
+# CV por oferta con el titular del rol desde el 25/11 (tailor.py, commit b61ba7e). Los PDF hechos antes dicen «Full Stack
+# Developer» para todo: Jero 25/11 vio que en Metabase y Airtm se subía ese. Se regeneran antes de usarlos.
+TAILOR_SINCE = datetime(2026, 11, 25, 17, 0, tzinfo=timezone.utc).timestamp()
+
+
+def fresh_cv(job: dict, cfg: dict) -> str:
+    """Ruta del CV personalizado para esta oferta, generado con el tailor actual. Reusa el de applications.cv_path si es
+    nuevo; si no existe o es anterior a TAILOR_SINCE, lo vuelve a armar y lo guarda. Si falla, el CV base."""
+    import tailor
+    with connect() as db:
+        row = db.execute("SELECT cv_path FROM applications WHERE job_id=?", (job["id"],)).fetchone()
+    old = Path(row["cv_path"]) if row and row["cv_path"] else None
+    if old and old.exists() and old.stat().st_mtime >= TAILOR_SINCE:
+        return str(old)
+    language = application_language(job, cfg, "")
+    cv = cv_for(cfg, language)
+    try:
+        result = tailor.build(job, cv, cfg, language, False)
+    except Exception as exc:
+        with connect() as db:
+            log_event(db, job["id"], "tailor_error", f"No se pudo personalizar el CV ({exc}); se usa el original")
+        return str(upload_copy(cv))
+    with connect() as db:
+        db.execute("UPDATE applications SET cv_path=? WHERE job_id=?", (str(result["pdf"]), job["id"]))
+        log_event(db, job["id"], "tailored", f"CV rehecho para el rol ({result.get('headline') or 'sin titular'})")
+    return str(result["pdf"])
+
+
 def reserve(job: dict, recipient: str, decision: dict, cv: dict, channel: str) -> None:
     """Persist intent before sending so a crash never leads to a duplicate application."""
     with connect() as db:
@@ -1893,12 +1921,8 @@ def signup_cv(job: dict, cfg: dict) -> str:
     si no el CV base en el idioma de la oferta. Jero 23/11: en Capgemini el registro quedó trabado por el CV."""
     with connect() as db:
         row = db.execute("SELECT cv_path FROM applications WHERE job_id=?", (job["id"],)).fetchone()
-    path = Path(row["cv_path"]) if row and row["cv_path"] else None
-    if path and path.exists():
-        return str(path)
     try:
-        cv = cv_for(cfg, detect_language(job.get("description") or ""))
-        return str(upload_copy(cv))
+        return fresh_cv(job, cfg)
     except Exception:
         return ""
 

@@ -314,12 +314,7 @@ def attach_cv(target_id: str, cv_path: str) -> bool:
 
 
 def job_cv_path(job_id: int, cfg: dict) -> str:
-    info = radar.job(job_id)
-    with agent.connect() as db:
-        row = db.execute("SELECT cv_path FROM applications WHERE job_id=?", (job_id,)).fetchone()
-    if row and row["cv_path"] and agent.Path(row["cv_path"]).exists():
-        return row["cv_path"]
-    return str(agent.upload_copy(agent.cv_for(cfg, agent.application_language(info, cfg, ""))))
+    return agent.fresh_cv(radar.job(job_id), cfg)
 
 
 def scroll_to_captcha(tab_ids: list[str]) -> str:
@@ -361,8 +356,7 @@ def _fill(job: dict, cfg: dict) -> None:
     letter = (app_row["body"] if app_row else "").split("\n\nRespuestas del formulario:")[0]
     language = agent.application_language(info, cfg, "")
     cv = agent.cv_for(cfg, language)
-    cv_path = app_row["cv_path"] if app_row and app_row["cv_path"] and agent.Path(app_row["cv_path"]).exists() \
-        else str(agent.upload_copy(cv))
+    cv_path = agent.fresh_cv(info, cfg)  # el CV con el titular del rol, nunca uno viejo «Full Stack» (Jero 25/11)
     old_tabs = json.loads(job.get("tabs") or "[]")
     tab_url, tab_title = _tab_url(old_tabs) if job["state"] == "checked" else ("", "")
     where = (f"YA HAY UNA PESTAÑA ABIERTA con esta postulación (URL: {tab_url} · título: {tab_title}). Seleccionala con "
@@ -424,11 +418,15 @@ def _fill(job: dict, cfg: dict) -> None:
         _close_tabs(job_id)
     elif outcome == "ready":
         agent.set_hold(job_id, int(cfg["autopilot"].get("hold_minutes", 180)), tabs=tabs)
-        for target in tabs:  # el CV adjunto no depende de que el modelo se haya acordado
+        for target in tabs:  # el CV adjunto no depende de que el modelo se haya acordado; se hace UNA vez, antes de Jero
             try:
                 state = page_eval(target, PAGE_JS)
                 if isinstance(state, dict) and state.get("cv_missing"):
                     attach_cv(target, cv_path)
+                    time.sleep(6)  # que el sitio termine de procesar el archivo antes de que Jero toque nada
+                label = json.dumps(f"[WW {info['company']}: falta captcha y Enviar]")
+                page_eval(target, "() => { if (!document.title.startsWith('[WW')) { document.title = " + label
+                          + " + ' ' + document.title; } return document.title; }")
             except Exception:
                 pass
         scroll_to_captcha(tabs)
@@ -450,6 +448,9 @@ def _fill(job: dict, cfg: dict) -> None:
         with agent.connect() as db:
             agent.log_event(db, job_id, "tanda_failed", "El agente no lo pudo dejar listo: " + detail[:400])
 
+
+SENT_URL = re.compile(r"/thanks|/thank-you|/confirmation|/success|application-submitted|/submitted", re.I)
+SENT_TITLE = re.compile(r"thank you|thanks for applying|application (submitted|received)|gracias por postular", re.I)
 
 CLOSED = re.compile(r"404|not found|couldn.t find anything|no longer (accepting|available)|job (has been )?(closed|removed)|"
                     r"posting (is )?(closed|removed)|ya no (est[aá] disponible|acepta|recibe)|aviso (cerr|vencid)", re.I)
@@ -493,11 +494,19 @@ def _watch_once(seen_challenge: dict) -> None:
                 waiting[t] = r
     if not waiting:
         return
-    open_ids = {t["id"] for t in agent.vm_tabs()}
+    tabs_now = {t["id"]: t for t in agent.vm_tabs()}
+    open_ids = set(tabs_now)
     done = set()
     for target, r in waiting.items():
         job_id = r["job_id"]
         if target not in open_ids or job_id in done:
+            continue
+        if r["state"] == "ready":  # entregada a Jero: no se toca la página, solo se mira la URL y el título
+            info = tabs_now[target]
+            if SENT_URL.search(info.get("url", "")) or SENT_TITLE.search(info.get("title", "")):
+                touch()
+                sent(job_id)
+                done.add(job_id)
             continue
         try:
             state = page_eval(target, PAGE_JS)
@@ -516,12 +525,7 @@ def _watch_once(seen_challenge: dict) -> None:
             _close_tabs(job_id)
             _set(job_id, state="skipped", detail="El aviso ya no existe o cerró")
             done.add(job_id)
-        elif r["state"] == "ready" and state.get("verifyError") and state.get("cv_missing"):
-            try:
-                if attach_cv(target, job_cv_path(job_id, radar.config())):
-                    _set(job_id, detail="El sitio había borrado el CV: lo volví a adjuntar. Tocá Enviar de nuevo y resolvé el captcha.")
-            except Exception:
-                pass
+
         elif (r["state"] == "opening" and not state["cloudflare"] and (state["token"] or not state["captcha"])
               and (datetime.now(timezone.utc) - radar.parse_time(r["updated_at"])).total_seconds() > 15):
             touch()
