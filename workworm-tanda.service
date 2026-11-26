@@ -1,0 +1,14 @@
+[Unit]
+Description=WorkWorm: tanda de captchas (llena formularios por delante mientras Jero resuelve los captchas)
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/workworm
+Environment=DISPLAY=:1
+Environment=PATH=%h/toolchains/bin:%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.pendant-runtime/env
+ExecStart=/home/ubuntu/workworm/.venv/bin/python /home/ubuntu/workworm/tanda.py --worker
+Restart=on-failure
+RestartSec=15

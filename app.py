@@ -280,9 +280,10 @@ def control_panel():
             at = "solo a mano"
         left.markdown(f"<div class='status-line'><b>{state}</b> &nbsp;·&nbsp; próxima revisión {at or '—'}</div>",
                       unsafe_allow_html=True)
-        if mid.button("▶ REVISAR AHORA", type="primary", width="stretch", key="start-cycle",
-                      help="No hace falta: el agente corre solo. Sirve para no esperar a la próxima revisión."):
-            agent.start_cycle()
+        if mid.button("▶ CORRER AHORA", type="primary", width="stretch", key="start-cycle",
+                      help="Cuando terminaste lo que te tocaba (logins, Cloudflare, códigos): el agente reintenta en el "
+                           "momento, antes de que se venza la sesión. No busca ofertas nuevas, así es rápido."):
+            agent.start_cycle(force_collect=False)
             st.session_state["start_clicked"] = time.time()
             st.rerun()
     toggled = right.toggle("PILOTO ACTIVO" if pilot_now["enabled"] else "PILOTO EN PAUSA", value=pilot_now["enabled"],
@@ -317,7 +318,7 @@ for notice in dict.fromkeys(gmail_expired()):
 _sched = scheduler_status()
 if _sched["state"] in ("missing", "moved", "disabled"):
     _warn, _fix = st.columns([5, 1.4], vertical_alignment="center")
-    _warn.warning(f"[!!] {_sched['detail']} El agente no corre solo: solo cuando tocás «Revisar ahora».")
+    _warn.warning(f"[!!] {_sched['detail']} El agente no corre solo: solo cuando tocás «Correr ahora».")
     if _fix.button("Instalar tareas", key="install-tasks",
                    help="Registra en Windows las tareas «WorkWorm» (ciclo del agente) y «WorkWorm - Tablero» "
                         "para esta carpeta. También las habilita."):
@@ -355,6 +356,96 @@ with board:
     if not pilot.get("reply_to_recruiters", True):
         st.caption("> El agente no responde a ningún reclutador: sigue los correos y actualiza los estados. "
                    "Se cambia en Configuración → Piloto automático.")
+    # 2026-11-20, Jero: tanda de captchas. El agente llena, él solo resuelve el captcha y envía (tanda.py).
+    @st.fragment(run_every="5s")
+    def tanda_panel():
+        import tanda
+        importlib.reload(tanda)
+        items = tanda.rows()
+        pending = [r for r in items if r["state"] in tanda.OPEN_STATES]
+        on = tanda.active()
+        if not on and not pending and not tanda.candidates():
+            return
+        st.markdown("### Tanda de captchas")
+        sent_today = sum(1 for r in items if r["state"] == "sent" and (r["updated_at"] or "")[:10] == datetime.now(
+            timezone.utc).date().isoformat())
+        c1, c2, c3 = st.columns([2, 1, 1])
+        c1.caption(("Corriendo: el agente llena los formularios de a uno, con uno de ventaja. Vos resolvés el captcha y "
+                    "enviás en la pestaña: el agente se da cuenta solo (no hace falta volver acá)." if on else
+                    "El agente llena cada formulario en el Chrome de la VM y vos solo resolvés el captcha y enviás. "
+                    "Videos y cuentas nuevas no entran.") + f" Enviadas hoy en tandas: {sent_today}.")
+        if on:  # Jero 23/11: «hice clic en empezar tanda y no parece haber pasado nada» → qué está haciendo ahora
+            doing = next((x for x in items if x["state"] in ("filling", "checked")), None)
+            waiting_n = len([x for x in items if x["state"] in ("ready", "opening")])
+            queued_n = len([x for x in items if x["state"] == "queued"])
+            c2.markdown(f"**Ahora:** {'llenando ' + (doing['company'] or '?') if doing else 'esperándote' if waiting_n else 'buscando el próximo'}"
+                        f" · {waiting_n} te esperan · {queued_n} en cola")
+            if c3.button("Terminar tanda", key="tanda-stop", width="stretch"):
+                tanda.stop()
+                st.rerun()
+        else:
+            # Jero 25/11: «dice 83 y se abren 5»: el número es la cola entera; el agente abre de a pocas para no tapar la pantalla
+            if c2.button(f"▶ Empezar tanda ({len(pending) or len(tanda.candidates())} en cola, abre de a {tanda.AHEAD})", key="tanda-start",
+                         type="primary", width="stretch"):
+                tanda.start()
+                st.toast("Tanda arrancada: el agente abre los formularios en el Chrome de la VM (el primero tarda 2 a 5 min)")
+                st.rerun()
+        labels = {"ready": "LISTO: resolvé el captcha y enviá",
+                  "opening": "TE ESPERA: pasá la verificación o el captcha en la pestaña y tocá «Listo» (el agente sigue)",
+                  "checked": "verificado, el agente está llenando", "filling": "el agente está llenando",
+                  "queued": "en cola"}
+        labels["failed"] = "EL AGENTE NO LO TERMINÓ: completá lo que falte y enviá, o «No salió»"
+        cards = [x for x in items if x["state"] in ("ready", "opening")
+                 or (x["state"] == "failed" and x["tabs"] not in ("", "[]") and tanda.tab_info(x["tabs"]))]
+        for r in cards:
+            box = st.container(border=True)
+            box.markdown(f"**{r['company']}** · {r['title']} — {labels[r['state']]}")
+            where = tanda.tab_info(r["tabs"])
+            if where:
+                box.caption(f"Pestaña: {where}")
+            if r["detail"]:
+                box.caption(r["detail"][:400])
+            b1, b2, b3, b4 = box.columns(4)
+            if b1.button("Ver pestaña", key=f"tanda-show-{r['job_id']}", width="stretch"):
+                tanda.show(r["job_id"])
+            if r["state"] == "opening":
+                if b2.button("Listo, el agente sigue", key=f"tanda-chk-{r['job_id']}", type="primary", width="stretch"):
+                    tanda.checked(r["job_id"])
+                    st.rerun()
+            elif r["state"] == "failed":
+                if b2.button("Enviado → siguiente", key=f"tanda-sent-{r['job_id']}", type="primary", width="stretch"):
+                    tanda.sent(r["job_id"])
+                    st.rerun()
+                if box.button("Resolví el captcha: que el agente siga en esa pestaña", key=f"tanda-cont-{r['job_id']}",
+                              width="stretch"):
+                    tanda.checked(r["job_id"])
+                    st.rerun()
+            else:
+                if b2.button("Enviado → siguiente", key=f"tanda-sent-{r['job_id']}", type="primary", width="stretch"):
+                    tanda.sent(r["job_id"])
+                    st.rerun()
+            if b3.button("No salió", key=f"tanda-fail-{r['job_id']}", width="stretch"):
+                tanda.failed(r["job_id"], "Jero marcó que no salió")
+                st.rerun()
+            if b4.button("Saltear", key=f"tanda-skip-{r['job_id']}", width="stretch"):
+                tanda.skip(r["job_id"])
+                st.rerun()
+        rest = [x for x in items if x["state"] in ("checked", "filling", "queued")]
+        if rest:
+            st.caption("Después: " + " · ".join(f"{x['company']} ({labels[x['state']]})" for x in rest[:12])
+                       + (f" y {len(rest) - 12} más" if len(rest) > 12 else ""))
+        failed = [x for x in items if x["state"] == "failed" and x not in cards]
+        if failed:
+            st.caption(f"No salieron en la tanda ({len(failed)}, sin pestaña abierta; vuelven en la próxima): "
+                       + " · ".join(f"{x['company']}" for x in failed))
+
+    tanda_panel()
+    creating = agent.accounts_pending()
+    if creating:  # Jero 23/11: «hice clic en crear las cuentas, tampoco pareció hacer nada» → progreso visible
+        names = [(radar.job(i) or {}).get("company") or "?" for i in creating]
+        st.info(f"Creando cuentas en el Chrome de la VM, de a una (4 a 8 min cada una): ahora **{names[0]}**"
+                + (f"; después {', '.join(names[1:6])}{'…' if len(names) > 6 else ''}" if len(names) > 1 else "")
+                + ". El resultado de cada una queda acá, en su tarjeta, y la oferta vuelve a la cola sola (el mail de pendientes está apagado desde el 19/11).")
     attention_jobs = [j for j in radar.jobs("action_needed")]
     if attention_jobs:
         st.markdown(f"### [!!] Requieren tu atención · {len(attention_jobs)}")
@@ -362,12 +453,21 @@ with board:
                    "si era un formulario, la oferta vuelve a la cola y se postula en la próxima revisión; "
                    "si era un mensaje de un reclutador, el agente le responde con lo que escribas.")
         account_jobs = [j for j in attention_jobs if agent.attention_kind(j) == "account"]
+        to_create = [j for j in account_jobs if not agent.auto_login_site(j.get("login_url") or "", j["url"])
+                     and not agent.account_creating(j["id"])]
+        if len(to_create) > 1:
+            if st.button(f"Sí, creá todas las cuentas ({len(to_create)}: "
+                         + ", ".join(j["company"] or "?" for j in to_create[:6]) + ("…" if len(to_create) > 6 else "")
+                         + ")", type="primary", width="stretch"):
+                agent.approve_accounts([j["id"] for j in to_create])
+                st.toast("Creando las cuentas de a una en el Chrome de la VM; te llega el resultado en el mail")
+                st.rerun()
         if len(account_jobs) > 1:
             b1, b2 = st.columns(2)
             if b1.button(f"Abrir todos los logins ({len({radar.urlparse(j.get('login_url') or j['url']).netloc for j in account_jobs})} sitios)",
                          type="primary", width="stretch", disabled=bool(agent.running())):
                 agent.open_login_pages([j["id"] for j in account_jobs])
-                st.toast("Abiertos en el Edge del agente: entrá con Google en cada pestaña y cerrá la ventana")
+                st.toast("Abiertos en el Chrome de la VM: entrá con Google en cada pestaña y cerrá la ventana")
             if b2.button("Listo, reintentar todas", width="stretch"):
                 for j in account_jobs:
                     agent.retry_after_account(j["id"])
@@ -385,11 +485,14 @@ with board:
                             "y enviala. Después tocá «Ya me postulé» y el agente sigue la conversación por correo.")
                 with radar.connect() as db:
                     app_row = db.execute("SELECT body, cv_path FROM applications WHERE job_id=?", (j["id"],)).fetchone()
-                if box.button("Completar el formulario en el Edge del agente (vos resolvés el captcha y enviás)",
+                if box.button("Completar el formulario en el Chrome de la VM (vos resolvés el captcha y enviás)",
                               key=f"fin-assist-{j['id']}", type="primary", width="stretch", disabled=bool(agent.running())):
-                    with st.spinner("El agente está completando el formulario (3 a 10 min)…"):
-                        result = agent.assist_form(j["id"], cfg)
-                    (box.success if result["ready"] else box.warning)(result["detail"])
+                    import subprocess, sys
+                    subprocess.Popen([sys.executable, "-c", f"import agent, radar; agent.assist_form({j['id']}, radar.config())"],
+                                     cwd=str(radar.ROOT), start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    box.info("El agente lo está completando en el Chrome de la VM (3 a 10 min). Cuando termine queda en una "
+                             "pestaña nueva, lista para el captcha o el video; lo ves en esta tarjeta.")
                 f1, f2, f3, f4 = box.columns(4)
                 f1.link_button("Abrir oferta", j["url"], width="stretch")
                 cv_file = Path(app_row["cv_path"]) if app_row and app_row["cv_path"] else None
@@ -417,9 +520,17 @@ with board:
                 else:
                     box.caption("Abrí la oferta, tocá «Postularme» → «Continuar con Google» (o creá la cuenta), cerrá la "
                                 "ventana y «Listo, reintentar».")
+                creating = agent.account_creating(j["id"])
+                if creating:
+                    box.info("Creando la cuenta (lo aprobaste). Tarda unos minutos; el resultado aparece en esta tarjeta.")
+                elif not agent.auto_login_site(j.get("login_url") or "", j["url"]):
+                    if box.button(f"Sí, creá la cuenta (con {cfg['candidate_email']}, contraseña cifrada en el servidor)",
+                                  key=f"acc-create-{j['id']}", type="primary", width="stretch"):
+                        agent.approve_accounts([j["id"]])
+                        st.rerun()
                 a1, a2, a3 = box.columns(3)
-                if a1.button("Abrir login en el Edge del agente" if j.get("login_url") else "Abrir en el Edge del agente",
-                             key=f"acc-open-{j['id']}", type="primary", width="stretch"):
+                if a1.button("Abrir login en el Chrome de la VM" if j.get("login_url") else "Abrir en el Chrome de la VM",
+                             key=f"acc-open-{j['id']}", width="stretch"):
                     agent.open_login_pages([j["id"]])
                 if a2.button("Listo, reintentar", key=f"acc-retry-{j['id']}", width="stretch"):
                     agent.retry_after_account(j["id"])
@@ -468,7 +579,7 @@ with board:
                 if kind == "form":
                     agent.mark_applied_manually(j["id"])
                 else:
-                    radar.set_status(j["id"], "conversation", "Lo resolviste vos")
+                    agent.resolve_pending(j["company"], "Lo resolviste vos")  # also closes its Google Task and mail entry
                 st.rerun()
             if drop:
                 radar.set_status(j["id"], "discarded")
@@ -700,6 +811,49 @@ with analytics:
                 help=f"Avisos de LinkedIn para que te postules vos. Además hay "
                      f"{sum(1 for j in manual_jobs if not j.get('linkedin_apply'))} sin revisar por el agente.")
     st.divider()
+    # 2026-11-20, Jero: «quiero ver qué tanto ganamos o perdemos a medida que hacemos cambios» (metrics.py).
+    st.subheader("Evolución: qué rinde cada cambio")
+    try:
+        import altair as alt
+        import metrics
+        importlib.reload(metrics)
+        ev_days = st.select_slider("Días", options=[14, 30, 60], value=30, key="ev-days")
+        per_day = metrics.daily(ev_days)
+        rows = [{"día": d.isoformat(), "resultado": k, "cantidad": v}
+                for d, c in per_day.items() for k, v in c.items() if k != "descartada al leer"]
+        rates = [{"día": d.isoformat(), **metrics.summarize(c)} for d, c in per_day.items()]
+        marks = [{"día": c["date"], "cambio": c["title"]} for c in metrics.changes()
+                 if c["date"] >= (min(per_day) if per_day else datetime.now().date()).isoformat()]
+        if rows:
+            colors = alt.Scale(domain=metrics.OUTCOMES, range=["#2e7d32", "#66bb6a", "#e53935", "#8e24aa", "#fb8c00",
+                                                              "#fdd835", "#757575", "#bdbdbd", "#90a4ae", "#4fc3f7"])
+            bars = alt.Chart(pd.DataFrame(rows)).mark_bar().encode(
+                x=alt.X("día:T", title=None), y=alt.Y("sum(cantidad):Q", title="Intentos por resultado"),
+                color=alt.Color("resultado:N", scale=colors, sort=metrics.OUTCOMES), tooltip=["día:T", "resultado", "cantidad"])
+            rules = alt.Chart(pd.DataFrame(marks or [{"día": None, "cambio": ""}])).mark_rule(
+                strokeDash=[4, 3], color="#9e9e9e").encode(x="día:T", tooltip=["día:T", "cambio"])
+            st.altair_chart(alt.layer(bars, rules).properties(height=260), width="stretch")
+            rate_df = pd.DataFrame([r for r in rates if r["tasa"] is not None])
+            if not rate_df.empty:
+                line = alt.Chart(rate_df).mark_line(point=True, color="#2e7d32").encode(
+                    x=alt.X("día:T", title=None), y=alt.Y("tasa:Q", title="Enviadas / intentos", axis=alt.Axis(format="%")),
+                    tooltip=["día:T", alt.Tooltip("tasa:Q", format=".0%"), "intentos", "enviadas"])
+                st.altair_chart(alt.layer(line, rules).properties(height=180), width="stretch")
+            st.caption("Las líneas punteadas son los cambios (pasá el mouse para ver cuál). «Descartada al leer» no cuenta "
+                       "como intento: el agente decidió no postular al leer el aviso completo.")
+        st.markdown("<div class='panel-title'>Cada cambio: 7 días antes contra 7 días después</div>", unsafe_allow_html=True)
+        ba = pd.DataFrame(metrics.before_after())
+        if not ba.empty:
+            for col in ("tasa antes", "tasa después"):
+                ba[col] = ba[col].map(metrics.pct)
+            st.dataframe(ba.iloc[::-1], hide_index=True, width="stretch")
+        st.markdown("<div class='panel-title'>Por semana de envío: qué pasó después</div>", unsafe_allow_html=True)
+        coh = pd.DataFrame(metrics.cohorts())
+        if not coh.empty:
+            st.dataframe(coh.fillna(0).iloc[::-1], hide_index=True, width="stretch")
+    except Exception as exc:  # the rest of the tab must keep working
+        st.error(f"Evolución: {exc}")
+    st.divider()
     if not applied:
         st.info("Las analíticas de postulaciones aparecen cuando se envía el primer CV. Abajo, el panorama de ofertas encontradas.")
     a1, a2 = st.columns(2)
@@ -910,10 +1064,11 @@ with sources_tab:
                 "contact": "Te escribieron"}
     rows = []
     for key, (name, how, apply_how) in radar.SOURCES.items():
-        problems = [e for e in errors if e.startswith(prefixes[key])]
-        rows.append({"Plataforma": name, "Activa": "Sí" if enabled[key] else "No",
+        problems = [e for e in errors if e.startswith(prefixes.get(key, name))]
+        rows.append({"Plataforma": name, "Activa": "Sí" if enabled.get(key, key == "ashby" and any(
+                         b["provider"] == "ashby" for b in cfg["boards"])) else "No",
                      "Ofertas encontradas": found.get(key, 0), "Postulaciones": applied_by.get(key, 0),
-                     "Última búsqueda": ("[!] " + problems[0][:80]) if problems else ("OK" if last and enabled[key] else "—"),
+                     "Última búsqueda": ("[!] " + problems[0][:80]) if problems else ("OK" if last and enabled.get(key) else "—"),
                      "Cómo se obtienen": how, "Cómo se postula": apply_how})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     st.caption("Empresas seguidas por API: " + ", ".join(f"{b['name']} ({b['provider']})" for b in cfg["boards"])
@@ -1113,9 +1268,9 @@ with settings_general:
         st.subheader("Navegador del agente")
         st.write("Para formularios y LinkedIn el agente abre un Edge aparte, con su propio perfil, y lo cierra al terminar. "
                  "Iniciá sesión una vez en ese Edge en Indeed, Get on Board, Computrabajo y Bumeran. LinkedIn no se usa: ahí te postulás vos.")
-        if st.button("Abrir Edge del agente"):
+        if st.button("Abrir Chrome de la VM"):
             agent.open_agent_edge()
-            st.info("Se abrió el Edge del agente. Iniciá sesión y cerralo. No lo uses mientras corre un ciclo.")
+            st.info("Se abrió el Chrome de la VM. Iniciá sesión y cerralo. No lo uses mientras corre un ciclo.")
         st.subheader("Último ciclo")
         log_path = radar.ROOT / "data" / "scheduler.log"
         lines = [l for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip()] if log_path.exists() else []
